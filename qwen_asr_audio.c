@@ -18,9 +18,25 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+/* Modified Bessel function of the first kind, order 0.
+ * Power series approximation (converges fast for beta <= 10). */
+static double bessel_i0(double x) {
+    double sum = 1.0, term = 1.0, xx = x * x;
+    for (int k = 1; k <= 20; k++) {
+        term *= xx / (4.0 * (double)k * (double)k);
+        sum += term;
+    }
+    return sum;
+}
 
 #define SAMPLE_RATE  16000
 #define N_MEL        128
@@ -92,7 +108,7 @@ float *qwen_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_s
         }
     }
 
-    /* Resample to 16kHz if needed — windowed-sinc interpolation with
+    /* Resample to 16kHz if needed -- windowed-sinc interpolation with
      * Kaiser window for proper anti-aliasing when downsampling. */
     if (sample_rate != SAMPLE_RATE) {
         int new_n = (int)((long long)n_frames * SAMPLE_RATE / sample_rate);
@@ -106,17 +122,8 @@ float *qwen_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_s
         double ratio = (double)SAMPLE_RATE / (double)sample_rate;
         double cutoff = (ratio < 1.0) ? ratio : 1.0;
 
-        /* Precompute Kaiser window: I0(beta * sqrt(1 - (n/N)^2)) / I0(beta)
-         * I0 approximation via power series (converges fast for beta <= 10). */
-        /* I0 (modified Bessel, first kind, order 0) */
-        #define BESSEL_I0(x) ({ \
-            double _sum = 1.0, _term = 1.0, _xx = (x)*(x); \
-            for (int _k = 1; _k <= 20; _k++) { \
-                _term *= _xx / (4.0 * (double)_k * (double)_k); \
-                _sum += _term; \
-            } \
-            _sum; })
-        double inv_I0_beta = 1.0 / BESSEL_I0(KAISER_BETA);
+        /* Precompute Kaiser window denominator: I0(beta) */
+        double inv_I0_beta = 1.0 / bessel_i0(KAISER_BETA);
 
         for (int i = 0; i < new_n; i++) {
             double src_pos = (double)i / ratio;
@@ -144,7 +151,7 @@ float *qwen_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_s
                 if (npos <= -1.0 || npos >= 1.0) {
                     w = 0.0;
                 } else {
-                    w = BESSEL_I0(KAISER_BETA * sqrt(1.0 - npos * npos)) * inv_I0_beta;
+                    w = bessel_i0(KAISER_BETA * sqrt(1.0 - npos * npos)) * inv_I0_beta;
                 }
 
                 double coeff = s * w * cutoff;
@@ -156,7 +163,6 @@ float *qwen_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_s
             /* Normalize to handle edge effects at boundaries */
             resampled[i] = (wsum > 1e-9) ? (float)(acc / wsum) : 0.0f;
         }
-        #undef BESSEL_I0
         free(samples);
         samples = resampled;
         n_frames = new_n;
@@ -187,6 +193,9 @@ float *qwen_load_wav(const char *path, int *out_n_samples) {
 }
 
 float *qwen_read_pcm_stdin(int *out_n_samples) {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
     size_t capacity = 1024 * 1024;
     size_t size = 0;
     uint8_t *buf = (uint8_t *)malloc(capacity);

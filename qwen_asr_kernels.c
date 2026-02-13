@@ -9,13 +9,20 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <pthread.h>
+#endif
+
 #if (defined(__AVX512F__) || defined(__AVX2__)) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
 #endif
 #ifdef __APPLE__
 #include <sys/sysctl.h>
-#else
+#elif !defined(_WIN32)
 #include <unistd.h>
 #endif
 
@@ -25,6 +32,11 @@
 #else
 #include <cblas.h>
 #endif
+#endif
+
+#ifdef USE_CUBLAS
+#include "qwen_asr_gpu.h"
+extern qwen_gpu_ctx_t *g_gpu_ctx;
 #endif
 
 #ifndef M_PI
@@ -38,6 +50,122 @@
 #define QWEN_MAX_THREADS 16
 
 typedef void (*parallel_fn_t)(int tid, int n_threads, void *arg);
+
+#ifdef _WIN32
+
+static struct {
+    HANDLE threads[QWEN_MAX_THREADS - 1];
+    int tids[QWEN_MAX_THREADS - 1];
+    int n_threads;
+    int shutdown;
+
+    parallel_fn_t fn;
+    void *arg;
+    int generation;
+
+    CRITICAL_SECTION mutex;
+    CONDITION_VARIABLE cond_work;
+    CONDITION_VARIABLE cond_done;
+    int n_done;
+    int initialized;
+} tp;
+
+static void tp_ensure_init(void) {
+    if (tp.initialized) return;
+    InitializeCriticalSection(&tp.mutex);
+    InitializeConditionVariable(&tp.cond_work);
+    InitializeConditionVariable(&tp.cond_done);
+    tp.n_threads = 1;
+    tp.initialized = 1;
+}
+
+static DWORD WINAPI worker_loop(LPVOID arg) {
+    int tid = *(int *)arg;
+    int my_gen = 0;
+
+    for (;;) {
+        EnterCriticalSection(&tp.mutex);
+        while (tp.generation == my_gen && !tp.shutdown)
+            SleepConditionVariableCS(&tp.cond_work, &tp.mutex, INFINITE);
+        if (tp.shutdown) {
+            LeaveCriticalSection(&tp.mutex);
+            return 0;
+        }
+        my_gen = tp.generation;
+        parallel_fn_t fn = tp.fn;
+        void *a = tp.arg;
+        int nt = tp.n_threads;
+        LeaveCriticalSection(&tp.mutex);
+
+        fn(tid, nt, a);
+
+        EnterCriticalSection(&tp.mutex);
+        if (++tp.n_done >= tp.n_threads - 1)
+            WakeConditionVariable(&tp.cond_done);
+        LeaveCriticalSection(&tp.mutex);
+    }
+}
+
+void qwen_set_threads(int n) {
+    tp_ensure_init();
+    if (n < 1) n = 1;
+    if (n > QWEN_MAX_THREADS) n = QWEN_MAX_THREADS;
+
+    /* Shutdown existing workers */
+    if (tp.n_threads > 1) {
+        EnterCriticalSection(&tp.mutex);
+        tp.shutdown = 1;
+        WakeAllConditionVariable(&tp.cond_work);
+        LeaveCriticalSection(&tp.mutex);
+        WaitForMultipleObjects(tp.n_threads - 1, tp.threads, TRUE, INFINITE);
+        for (int i = 0; i < tp.n_threads - 1; i++)
+            CloseHandle(tp.threads[i]);
+        tp.shutdown = 0;
+        tp.generation = 0;
+    }
+
+    tp.n_threads = n;
+    if (n <= 1) return;
+
+    for (int i = 0; i < n - 1; i++) {
+        tp.tids[i] = i + 1;
+        tp.threads[i] = CreateThread(NULL, 0, worker_loop, &tp.tids[i], 0, NULL);
+    }
+
+    if (qwen_verbose >= 2)
+        fprintf(stderr, "Thread pool: %d threads\n", n);
+}
+
+int qwen_get_num_cpus(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (int)si.dwNumberOfProcessors > 0 ? (int)si.dwNumberOfProcessors : 1;
+}
+
+/* Dispatch work to all threads; main thread is tid=0 */
+static void parallel_for(parallel_fn_t fn, void *arg) {
+    if (tp.n_threads <= 1) {
+        fn(0, 1, arg);
+        return;
+    }
+
+    EnterCriticalSection(&tp.mutex);
+    tp.fn = fn;
+    tp.arg = arg;
+    tp.n_done = 0;
+    tp.generation++;
+    WakeAllConditionVariable(&tp.cond_work);
+    LeaveCriticalSection(&tp.mutex);
+
+    fn(0, tp.n_threads, arg);
+
+    EnterCriticalSection(&tp.mutex);
+    while (tp.n_done < tp.n_threads - 1)
+        SleepConditionVariableCS(&tp.cond_done, &tp.mutex, INFINITE);
+    LeaveCriticalSection(&tp.mutex);
+}
+
+#else /* POSIX */
 
 static struct {
     pthread_t threads[QWEN_MAX_THREADS - 1];
@@ -152,6 +280,8 @@ static void parallel_for(parallel_fn_t fn, void *arg) {
     pthread_mutex_unlock(&tp.mutex);
 }
 
+#endif /* _WIN32 */
+
 /* ========================================================================
  * Basic Element-wise Operations
  * ======================================================================== */
@@ -195,6 +325,20 @@ void qwen_matmul_t(float *C, const float *A, const float *B, int M, int K, int N
 
 void qwen_linear(float *y, const float *x, const float *W, const float *b,
                  int seq_len, int in_dim, int out_dim) {
+#ifdef USE_CUBLAS
+    if (g_gpu_ctx) {
+        int handle = qwen_gpu_find_weight(g_gpu_ctx, W);
+        if (handle >= 0) {
+            qwen_gpu_gemm(g_gpu_ctx, y, x, handle, seq_len, in_dim, out_dim);
+            if (b != NULL) {
+                for (int s = 0; s < seq_len; s++)
+                    for (int o = 0; o < out_dim; o++)
+                        y[s * out_dim + o] += b[o];
+            }
+            return;
+        }
+    }
+#endif
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 seq_len, out_dim, in_dim,
@@ -436,6 +580,19 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
                                  const uint16_t *Wk_bf16,
                                  const uint16_t *Wv_bf16,
                                  int in_dim, int q_dim, int kv_dim) {
+#ifdef USE_CUBLAS
+    if (g_gpu_ctx) {
+        int hq = qwen_gpu_find_weight(g_gpu_ctx, Wq_bf16);
+        int hk = qwen_gpu_find_weight(g_gpu_ctx, Wk_bf16);
+        int hv = qwen_gpu_find_weight(g_gpu_ctx, Wv_bf16);
+        if (hq >= 0 && hk >= 0 && hv >= 0) {
+            qwen_gpu_gemm(g_gpu_ctx, q, x, hq, 1, in_dim, q_dim);
+            qwen_gpu_gemm(g_gpu_ctx, k, x, hk, 1, in_dim, kv_dim);
+            qwen_gpu_gemm(g_gpu_ctx, v, x, hv, 1, in_dim, kv_dim);
+            return;
+        }
+    }
+#endif
     if (tp.n_threads <= 1) {
         bf16_matvec_fused(q, x, Wq_bf16, NULL, in_dim, q_dim);
         bf16_matvec_fused(k, x, Wk_bf16, NULL, in_dim, kv_dim);
@@ -461,6 +618,15 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
 
 void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim) {
+#ifdef USE_CUBLAS
+    if (g_gpu_ctx) {
+        int handle = qwen_gpu_find_weight(g_gpu_ctx, W_bf16);
+        if (handle >= 0) {
+            qwen_gpu_gemm(g_gpu_ctx, y, x, handle, seq_len, in_dim, out_dim);
+            return;
+        }
+    }
+#endif
     if (seq_len == 1) {
         bf16_matvec_threaded(y, x, W_bf16, NULL, in_dim, out_dim);
         return;
@@ -473,6 +639,20 @@ void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
 
 void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
                       const float *b, int seq_len, int in_dim, int out_dim) {
+#ifdef USE_CUBLAS
+    if (g_gpu_ctx) {
+        int handle = qwen_gpu_find_weight(g_gpu_ctx, W_bf16);
+        if (handle >= 0) {
+            qwen_gpu_gemm(g_gpu_ctx, y, x, handle, seq_len, in_dim, out_dim);
+            if (b != NULL) {
+                for (int s = 0; s < seq_len; s++)
+                    for (int o = 0; o < out_dim; o++)
+                        y[s * out_dim + o] += b[o];
+            }
+            return;
+        }
+    }
+#endif
     if (seq_len == 1) {
         bf16_matvec_threaded(y, x, W_bf16, b, in_dim, out_dim);
         return;
@@ -517,6 +697,14 @@ static void argmax_worker(int tid, int n_threads, void *arg) {
 
 int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
                              int in_dim, int out_dim) {
+#ifdef USE_CUBLAS
+    if (g_gpu_ctx) {
+        int handle = qwen_gpu_find_weight(g_gpu_ctx, W_bf16);
+        if (handle >= 0) {
+            return qwen_gpu_argmax_matvec(g_gpu_ctx, x, handle, in_dim, out_dim);
+        }
+    }
+#endif
     if (tp.n_threads <= 1) {
         int best;
         float best_val;
@@ -544,6 +732,15 @@ int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
 
 void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                          int M, int K, int N) {
+#ifdef USE_CUBLAS
+    if (g_gpu_ctx) {
+        int handle = qwen_gpu_find_weight(g_gpu_ctx, B_bf16);
+        if (handle >= 0) {
+            qwen_gpu_gemm(g_gpu_ctx, C, A, handle, M, K, N);
+            return;
+        }
+    }
+#endif
     if (M == 1) {
         bf16_matvec_threaded(C, A, B_bf16, NULL, K, N);
     } else {
@@ -1001,9 +1198,10 @@ static inline void qwen_vec_scale_add(float *dst, const float *src, float correc
 }
 
 void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
-                                   const float *V, int seq __attribute__((unused)),
+                                   const float *V, int seq,
                                    int n_heads, int head_dim, float scale,
                                    const int *window_starts, int n_windows) {
+    (void)seq;
     int hidden = n_heads * head_dim;
 
     for (int h = 0; h < n_heads; h++) {

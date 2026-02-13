@@ -13,6 +13,9 @@
 #include "qwen_asr.h"
 #include "qwen_asr_kernels.h"
 #include "qwen_asr_safetensors.h"
+#ifdef USE_CUDA_KERNELS
+#include "qwen_asr_gpu.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -386,6 +389,42 @@ static void ensure_dec_buffers(qwen_ctx_t *ctx) {
 }
 
 int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
+#ifdef USE_CUDA_KERNELS
+    if (ctx->gpu_dec_ctx) {
+        extern qwen_gpu_ctx_t *g_gpu_ctx;
+        qwen_gpu_dec_ctx_t *dctx = (qwen_gpu_dec_ctx_t *)ctx->gpu_dec_ctx;
+        const qwen_config_t *cfg = &ctx->config;
+        int pos = ctx->kv_cache_len;
+
+        /* Sync CPU KV cache to GPU (needed after CPU prefill) */
+        if (ctx->kv_cache_k && pos > 0) {
+            if (qwen_gpu_kv_cache_sync(dctx, cfg,
+                                        ctx->kv_cache_k, ctx->kv_cache_v,
+                                        ctx->kv_cache_max, pos) != 0)
+                return QWEN_TOKEN_IM_END;
+        }
+
+        /* Ensure RoPE cache on GPU covers this position */
+        int head_dim = cfg->dec_head_dim;
+        if (ensure_rope_cache(ctx, pos + 1, head_dim, cfg->dec_rope_theta) != 0)
+            return QWEN_TOKEN_IM_END;
+        qwen_gpu_upload_rope(dctx, ctx->rope_cache_cos, ctx->rope_cache_sin,
+                              ctx->rope_cache_cap, head_dim);
+
+        /* Resolve probe layer */
+        int probe_layer = ctx->ts_probe_layer;
+
+        int peak_pos = ctx->last_peak_enc_pos;
+        int token = qwen_gpu_decoder_forward(dctx, g_gpu_ctx, &ctx->decoder, cfg,
+                                              input_embed, pos, probe_layer,
+                                              ctx->enc_kv_start, ctx->enc_kv_count,
+                                              &peak_pos);
+        ctx->last_peak_enc_pos = peak_pos;
+        ctx->kv_cache_len = pos + 1;
+        return token;
+    }
+#endif
+
     qwen_decoder_t *dec = &ctx->decoder;
     const qwen_config_t *cfg = &ctx->config;
     int dim = cfg->dec_hidden;
@@ -453,6 +492,43 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
         qwen_causal_attention(attn_out, q, full_k, full_v,
                                1, total_seq, n_heads, n_kv_heads,
                                head_dim, scale, pos);
+
+        /* Attention probe: find which encoder KV position has the highest
+         * attention score (summed across Q heads) in the selected layer.
+         * This gives a precise audio timestamp per generated text token. */
+        {
+            int probe_layer = ctx->ts_probe_layer;
+            if (probe_layer < 0) probe_layer = (cfg->dec_layers * 4 + 3) / 7; /* ~57% */
+            if (probe_layer >= cfg->dec_layers) probe_layer = cfg->dec_layers - 1;
+            if (layer == probe_layer &&
+                ctx->enc_kv_count > 0 && ctx->enc_kv_start >= 0) {
+                int enc_start = ctx->enc_kv_start;
+                int enc_end = enc_start + ctx->enc_kv_count;
+                if (enc_end > total_seq) enc_end = total_seq;
+                int gqa_ratio = n_heads / n_kv_heads;
+
+                float best_score = -1e30f;
+                int best_pos = enc_start;
+
+                for (int p = enc_start; p < enc_end; p++) {
+                    float sum = 0.0f;
+                    for (int h = 0; h < n_heads; h++) {
+                        int kv_h = h / gqa_ratio;
+                        const float *q_head = q + h * head_dim;
+                        const float *k_at_p = full_k + (size_t)p * kv_dim + kv_h * head_dim;
+                        float dot = 0.0f;
+                        for (int d = 0; d < head_dim; d++)
+                            dot += q_head[d] * k_at_p[d];
+                        sum += dot;
+                    }
+                    if (sum > best_score) {
+                        best_score = sum;
+                        best_pos = p;
+                    }
+                }
+                ctx->last_peak_enc_pos = best_pos;
+            }
+        }
 
         qwen_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
         qwen_add_inplace(x, proj_out, dim);

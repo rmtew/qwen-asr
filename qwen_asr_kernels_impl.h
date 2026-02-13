@@ -35,7 +35,7 @@ void qwen_vec_scale_add_neon(float *dst, const float *src, float correction, int
 #define qwen_vec_axpy_inplace_impl qwen_vec_axpy_inplace_neon
 #define qwen_vec_scale_add_impl qwen_vec_scale_add_neon
 
-#elif defined(__AVX2__) && defined(__FMA__)
+#elif defined(__AVX2__) && (defined(__FMA__) || defined(_MSC_VER))
 void qwen_bf16_matvec_fused_avx(float *y, const float *x, const uint16_t *W_bf16,
                                  const float *bias, int in_dim, int out_dim);
 void qwen_argmax_bf16_range_avx(const float *x, const uint16_t *W_bf16,

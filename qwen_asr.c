@@ -15,7 +15,22 @@
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <sys/time.h>
+#endif
+
+#ifdef _MSC_VER
+#define strdup _strdup
+#endif
+
+#ifdef USE_CUBLAS
+#include "qwen_asr_gpu.h"
+qwen_gpu_ctx_t *g_gpu_ctx = NULL;
+#endif
 
 /* Global verbose flag */
 int qwen_verbose = 0;
@@ -189,6 +204,83 @@ static int detect_config(qwen_ctx_t *ctx) {
 }
 
 /* ========================================================================
+ * GPU Weight Upload (cuBLAS)
+ * ======================================================================== */
+
+#ifdef USE_CUBLAS
+static void gpu_upload_encoder_weights(qwen_gpu_ctx_t *gpu,
+                                        const qwen_encoder_t *enc,
+                                        const qwen_config_t *cfg) {
+    int d = cfg->enc_d_model;
+    int ffn = cfg->enc_ffn_dim;
+    int out = cfg->enc_output_dim;
+    int conv_proj = cfg->enc_conv_proj_dim;
+    int n = 0;
+
+    /* Conv output projection (skip conv stem -- small, uses NN layout) */
+    if (enc->conv_out_weight)
+        n += (qwen_gpu_upload_weight_f32(gpu, enc->conv_out_weight, d, conv_proj) == 0);
+
+    /* Transformer layers */
+    for (int i = 0; i < cfg->enc_layers; i++) {
+        const qwen_enc_layer_t *l = &enc->layers[i];
+        if (l->wq_weight) n += (qwen_gpu_upload_weight_f32(gpu, l->wq_weight, d, d) == 0);
+        if (l->wk_weight) n += (qwen_gpu_upload_weight_f32(gpu, l->wk_weight, d, d) == 0);
+        if (l->wv_weight) n += (qwen_gpu_upload_weight_f32(gpu, l->wv_weight, d, d) == 0);
+        if (l->wo_weight) n += (qwen_gpu_upload_weight_f32(gpu, l->wo_weight, d, d) == 0);
+        if (l->fc1_weight) n += (qwen_gpu_upload_weight_f32(gpu, l->fc1_weight, ffn, d) == 0);
+        if (l->fc2_weight) n += (qwen_gpu_upload_weight_f32(gpu, l->fc2_weight, d, ffn) == 0);
+    }
+
+    /* Final projection layers */
+    if (enc->proj1_weight) n += (qwen_gpu_upload_weight_f32(gpu, enc->proj1_weight, d, d) == 0);
+    if (enc->proj2_weight) n += (qwen_gpu_upload_weight_f32(gpu, enc->proj2_weight, out, d) == 0);
+
+    if (qwen_verbose >= 1)
+        fprintf(stderr, "GPU: uploaded %d encoder f32 weights\n", n);
+}
+
+static void gpu_upload_decoder_weights(qwen_gpu_ctx_t *gpu,
+                                        const qwen_decoder_t *dec,
+                                        const qwen_config_t *cfg) {
+    int h = cfg->dec_hidden;
+    int q_dim = cfg->dec_heads * cfg->dec_head_dim;
+    int kv_dim = cfg->dec_kv_heads * cfg->dec_head_dim;
+    int inter = cfg->dec_intermediate;
+    int n = 0;
+
+    for (int i = 0; i < cfg->dec_layers; i++) {
+        const qwen_dec_layer_t *l = &dec->layers[i];
+        /* Attention weights */
+        if (l->wq_weight_bf16)
+            n += (qwen_gpu_upload_weight_bf16(gpu, l->wq_weight_bf16, q_dim, h) == 0);
+        if (l->wk_weight_bf16)
+            n += (qwen_gpu_upload_weight_bf16(gpu, l->wk_weight_bf16, kv_dim, h) == 0);
+        if (l->wv_weight_bf16)
+            n += (qwen_gpu_upload_weight_bf16(gpu, l->wv_weight_bf16, kv_dim, h) == 0);
+        if (l->wo_weight_bf16)
+            n += (qwen_gpu_upload_weight_bf16(gpu, l->wo_weight_bf16, h, q_dim) == 0);
+        /* FFN weights (separate gate/up for prefill, fused for single-token) */
+        if (l->gate_weight_bf16)
+            n += (qwen_gpu_upload_weight_bf16(gpu, l->gate_weight_bf16, inter, h) == 0);
+        if (l->up_weight_bf16)
+            n += (qwen_gpu_upload_weight_bf16(gpu, l->up_weight_bf16, inter, h) == 0);
+        if (l->down_weight_bf16)
+            n += (qwen_gpu_upload_weight_bf16(gpu, l->down_weight_bf16, h, inter) == 0);
+        if (l->gate_up_fused_bf16)
+            n += (qwen_gpu_upload_weight_bf16(gpu, l->gate_up_fused_bf16, 2 * inter, h) == 0);
+    }
+
+    /* Token embeddings (tied with lm_head, used by argmax_matvec) */
+    if (dec->tok_embeddings_bf16)
+        n += (qwen_gpu_upload_weight_bf16(gpu, dec->tok_embeddings_bf16, cfg->vocab_size, h) == 0);
+
+    if (qwen_verbose >= 1)
+        fprintf(stderr, "GPU: uploaded %d decoder bf16->f32 weights\n", n);
+}
+#endif /* USE_CUBLAS */
+
+/* ========================================================================
  * Model Loading
  * ======================================================================== */
 
@@ -228,6 +320,34 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
         return NULL;
     }
 
+    /* GPU acceleration (cuBLAS) */
+#ifdef USE_CUBLAS
+    g_gpu_ctx = qwen_gpu_init();
+    if (g_gpu_ctx) {
+        if (qwen_verbose >= 1) fprintf(stderr, "Uploading weights to GPU...\n");
+        gpu_upload_encoder_weights(g_gpu_ctx, &ctx->encoder, &ctx->config);
+        gpu_upload_decoder_weights(g_gpu_ctx, &ctx->decoder, &ctx->config);
+        qwen_gpu_print_stats(g_gpu_ctx);
+
+#ifdef USE_CUDA_KERNELS
+        /* Try to initialize full GPU decoder (custom CUDA kernels).
+         * Falls back to cuBLAS-only if CUBIN loading fails. */
+        {
+            qwen_gpu_dec_ctx_t *dctx = qwen_gpu_dec_init(g_gpu_ctx, &ctx->config);
+            if (dctx) {
+                qwen_gpu_upload_norm_weights(dctx, &ctx->decoder, &ctx->config);
+                ctx->gpu_dec_ctx = dctx;
+                if (qwen_verbose >= 1)
+                    fprintf(stderr, "GPU dec: full GPU decoder enabled\n");
+            } else {
+                if (qwen_verbose >= 1)
+                    fprintf(stderr, "GPU dec: CUBIN load failed, using cuBLAS-only fallback\n");
+            }
+        }
+#endif
+    }
+#endif
+
     /* Default transcription mode: full-audio offline decode (no splitting). */
     ctx->segment_sec = 0.0f;
     ctx->search_sec = 3.0f;
@@ -239,6 +359,7 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     ctx->stream_max_new_tokens = 32;
     ctx->past_text_conditioning = 0;
     ctx->skip_silence = 0;
+    ctx->ts_probe_layer = -1; /* default: ~60% through decoder stack */
 
     if (qwen_verbose >= 1) fprintf(stderr, "Model loaded.\n");
     return ctx;
@@ -250,6 +371,17 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
 
 void qwen_free(qwen_ctx_t *ctx) {
     if (!ctx) return;
+
+#ifdef USE_CUDA_KERNELS
+    if (ctx->gpu_dec_ctx) {
+        qwen_gpu_dec_free((qwen_gpu_dec_ctx_t *)ctx->gpu_dec_ctx);
+        ctx->gpu_dec_ctx = NULL;
+    }
+#endif
+#ifdef USE_CUBLAS
+    qwen_gpu_free(g_gpu_ctx);
+    g_gpu_ctx = NULL;
+#endif
 
     #define FREE0(p) do { free(p); (p) = NULL; } while (0)
 
@@ -307,6 +439,11 @@ void qwen_free(qwen_ctx_t *ctx) {
     free(ctx->rope_cache_cos); free(ctx->rope_cache_sin);
     free(ctx->rope_inv_freq);
 
+    /* Timestamp tracking */
+    free(ctx->token_audio_ms);
+    free(ctx->token_byte_offsets);
+    free(ctx->token_ts_out);
+
     /* Prompt/language options */
     free(ctx->prompt);
     free(ctx->force_language);
@@ -357,11 +494,22 @@ static void tok_embed_bf16_to_f32(float *dst, const uint16_t *tok_emb_bf16,
     }
 }
 
+#ifdef _WIN32
+static double get_time_ms(void) {
+    static LARGE_INTEGER freq;
+    static int freq_init = 0;
+    if (!freq_init) { QueryPerformanceFrequency(&freq); freq_init = 1; }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (double)now.QuadPart * 1000.0 / (double)freq.QuadPart;
+}
+#else
 static double get_time_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
+#endif
 
 static int cmp_float_asc(const void *a, const void *b) {
     float fa = *(const float *)a;
@@ -700,6 +848,17 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     /* ---- Decoder prefill ---- */
     t0 = get_time_ms();
     ctx->kv_cache_len = 0; /* Reset KV cache for this segment */
+#ifdef USE_CUDA_KERNELS
+    if (ctx->gpu_dec_ctx)
+        qwen_gpu_kv_cache_reset((qwen_gpu_dec_ctx_t *)ctx->gpu_dec_ctx);
+#endif
+
+    /* Record where encoder tokens land in KV cache for attention probing */
+    ctx->enc_kv_start = prefix_len;
+    ctx->enc_kv_count = enc_seq_len;
+    ctx->last_peak_enc_pos = -1;
+    ctx->token_ts_len = 0;
+
     int prefill_len = total_seq - 1; /* prefill all but last */
     qwen_decoder_prefill(ctx, input_embeds, prefill_len);
 
@@ -719,6 +878,18 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     /* If language is forced, <asr_text> is already part of prompt suffix. */
     int past_asr_text = (ctx->n_force_prompt_tokens > 0 || n_past_tokens > 0) ? 1 : 0;
 
+    /* Compute ms per encoder token for timestamp conversion.
+     * chunk_size mel frames -> tokens_per_chunk encoder tokens.
+     * Each mel frame = HOP_LENGTH / SAMPLE_RATE seconds = 10ms. */
+    int chunk_size = cfg->enc_chunk_size; /* 100 */
+    int tpc = chunk_size;
+    tpc = (tpc + 2 * 1 - 3) / 2 + 1;  /* conv1 stride 2 */
+    tpc = (tpc + 2 * 1 - 3) / 2 + 1;  /* conv2 stride 2 */
+    tpc = (tpc + 2 * 1 - 3) / 2 + 1;  /* conv3 stride 2 */
+    /* tpc = tokens_per_chunk (13 for chunk_size=100) */
+    float ms_per_enc_token = (float)(chunk_size * QWEN_HOP_LENGTH) /
+                             (float)QWEN_SAMPLE_RATE * 1000.0f / (float)tpc;
+
     size_t text_cap = 4096;
     size_t text_len = 0;
     char *text = (char *)malloc(text_cap);
@@ -734,6 +905,28 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
         if (token == QWEN_TOKEN_ASR_TEXT) {
             past_asr_text = 1;
         } else if (past_asr_text) {
+            /* Record per-token timestamp from attention probe */
+            if (ctx->token_ts_len >= ctx->token_ts_cap) {
+                int new_cap = ctx->token_ts_cap > 0 ? ctx->token_ts_cap * 2 : 256;
+                int *new_ms = (int *)realloc(ctx->token_audio_ms,
+                                             (size_t)new_cap * sizeof(int));
+                int *new_bo = (int *)realloc(ctx->token_byte_offsets,
+                                             (size_t)new_cap * sizeof(int));
+                if (new_ms && new_bo) {
+                    ctx->token_audio_ms = new_ms;
+                    ctx->token_byte_offsets = new_bo;
+                    ctx->token_ts_cap = new_cap;
+                }
+            }
+            if (ctx->token_ts_len < ctx->token_ts_cap) {
+                int enc_idx = ctx->last_peak_enc_pos - ctx->enc_kv_start;
+                if (enc_idx < 0) enc_idx = 0;
+                if (enc_idx >= ctx->enc_kv_count) enc_idx = ctx->enc_kv_count - 1;
+                ctx->token_byte_offsets[ctx->token_ts_len] = (int)text_len;
+                ctx->token_audio_ms[ctx->token_ts_len] = (int)(enc_idx * ms_per_enc_token);
+                ctx->token_ts_len++;
+            }
+
             /* Decode and emit this text token */
             const char *piece = qwen_tokenizer_decode(tokenizer, token);
             size_t piece_len = strlen(piece);
@@ -1646,6 +1839,31 @@ char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_sample
     if (start != result) memmove(result, start, strlen(start) + 1);
 
     return result;
+}
+
+int qwen_get_token_timestamps(qwen_ctx_t *ctx, const qwen_token_ts_t **out_ts, int *out_count) {
+    if (!ctx || !out_ts || !out_count) return -1;
+    if (ctx->token_ts_len <= 0) {
+        *out_ts = NULL;
+        *out_count = 0;
+        return -1;
+    }
+
+    /* Build combined array from the parallel internal arrays. */
+    if (ctx->token_ts_len > ctx->token_ts_out_cap) {
+        qwen_token_ts_t *tmp = (qwen_token_ts_t *)realloc(ctx->token_ts_out,
+            (size_t)ctx->token_ts_len * sizeof(qwen_token_ts_t));
+        if (!tmp) return -1;
+        ctx->token_ts_out = tmp;
+        ctx->token_ts_out_cap = ctx->token_ts_len;
+    }
+    for (int i = 0; i < ctx->token_ts_len; i++) {
+        ctx->token_ts_out[i].byte_offset = ctx->token_byte_offsets[i];
+        ctx->token_ts_out[i].audio_ms = ctx->token_audio_ms[i];
+    }
+    *out_ts = ctx->token_ts_out;
+    *out_count = ctx->token_ts_len;
+    return 0;
 }
 
 char *qwen_transcribe(qwen_ctx_t *ctx, const char *wav_path) {
