@@ -31,6 +31,7 @@ float *qwen_read_pcm_stdin(int *out_n_samples);
  * Note: Returns in [mel_bins, frames] layout for Conv2D compatibility. */
 float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames);
 
+#ifndef _MSC_VER
 /* Start a reader thread that incrementally fills a live audio buffer from stdin.
  * Detects WAV vs raw s16le. For WAV, requires 16kHz sample rate.
  * Returns NULL on error. Caller must call qwen_live_audio_free() when done. */
@@ -38,5 +39,6 @@ qwen_live_audio_t *qwen_live_audio_start_stdin(void);
 
 /* Join reader thread and free all resources. */
 void qwen_live_audio_free(qwen_live_audio_t *la);
+#endif
 
 #endif /* QWEN_ASR_AUDIO_H */

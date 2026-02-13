@@ -11,7 +11,7 @@
 
 #include "qwen_asr_kernels_impl.h"
 
-#if defined(__AVX2__) && defined(__FMA__)
+#if defined(__AVX2__) && (defined(__FMA__) || defined(_MSC_VER))
 
 #include <immintrin.h>
 #include <string.h>

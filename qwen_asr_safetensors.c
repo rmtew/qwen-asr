@@ -7,11 +7,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#endif
+
+#ifdef _MSC_VER
+#define strdup _strdup
+#endif
 
 /* ========================================================================
  * Minimal JSON parser for safetensors header
@@ -191,6 +201,58 @@ static int parse_header(safetensors_file_t *sf) {
  * Single file operations
  * ======================================================================== */
 
+#ifdef _WIN32
+
+safetensors_file_t *safetensors_open(const char *path) {
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return NULL;
+
+    LARGE_INTEGER li;
+    if (!GetFileSizeEx(hFile, &li)) { CloseHandle(hFile); return NULL; }
+    size_t file_size = (size_t)li.QuadPart;
+    if (file_size < 8) { CloseHandle(hFile); return NULL; }
+
+    HANDLE hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMapping) { CloseHandle(hFile); return NULL; }
+
+    void *data = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(hMapping);
+    CloseHandle(hFile);
+    if (!data) return NULL;
+
+    uint64_t header_size = 0;
+    memcpy(&header_size, data, 8);
+    if (header_size > file_size - 8) { UnmapViewOfFile(data); return NULL; }
+
+    safetensors_file_t *sf = calloc(1, sizeof(safetensors_file_t));
+    if (!sf) { UnmapViewOfFile(data); return NULL; }
+
+    sf->path = strdup(path);
+    sf->data = data;
+    sf->file_size = file_size;
+    sf->header_size = (size_t)header_size;
+
+    sf->header_json = malloc(header_size + 1);
+    if (!sf->header_json) { safetensors_close(sf); return NULL; }
+    memcpy(sf->header_json, (char *)data + 8, header_size);
+    sf->header_json[header_size] = '\0';
+
+    if (parse_header(sf) != 0) { safetensors_close(sf); return NULL; }
+
+    return sf;
+}
+
+void safetensors_close(safetensors_file_t *sf) {
+    if (!sf) return;
+    if (sf->data) UnmapViewOfFile(sf->data);
+    free(sf->path);
+    free(sf->header_json);
+    free(sf);
+}
+
+#else /* POSIX */
+
 safetensors_file_t *safetensors_open(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
@@ -234,6 +296,8 @@ void safetensors_close(safetensors_file_t *sf) {
     free(sf->header_json);
     free(sf);
 }
+
+#endif /* _WIN32 */
 
 const void *safetensors_data(const safetensors_file_t *sf, const safetensor_t *t) {
     return (const char *)sf->data + 8 + sf->header_size + t->data_offset;
@@ -330,22 +394,46 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
     }
 
     /* Scan directory for shard files */
-    DIR *dir = opendir(model_dir);
-    if (!dir) { free(ms); return NULL; }
-
-    struct dirent *entry;
     char shard_names[SAFETENSORS_MAX_SHARDS][256];
     int n_shards = 0;
 
-    while ((entry = readdir(dir)) != NULL && n_shards < SAFETENSORS_MAX_SHARDS) {
-        if (strncmp(entry->d_name, "model-", 6) == 0 &&
-            strstr(entry->d_name, ".safetensors") != NULL) {
-            snprintf(shard_names[n_shards], sizeof(shard_names[n_shards]),
-                     "%s", entry->d_name);
-            n_shards++;
+#ifdef _WIN32
+    {
+        char search_path[4096];
+        snprintf(search_path, sizeof(search_path), "%s\\model-*.safetensors", model_dir);
+        WIN32_FIND_DATAA ffd;
+        HANDLE hFind = FindFirstFileA(search_path, &ffd);
+        if (hFind == INVALID_HANDLE_VALUE) {
+            fprintf(stderr, "multi_safetensors_open: no safetensors files in %s\n", model_dir);
+            free(ms);
+            return NULL;
         }
+        do {
+            if (n_shards < SAFETENSORS_MAX_SHARDS) {
+                snprintf(shard_names[n_shards], sizeof(shard_names[n_shards]),
+                         "%s", ffd.cFileName);
+                n_shards++;
+            }
+        } while (FindNextFileA(hFind, &ffd) != 0);
+        FindClose(hFind);
     }
-    closedir(dir);
+#else
+    {
+        DIR *dir = opendir(model_dir);
+        if (!dir) { free(ms); return NULL; }
+
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL && n_shards < SAFETENSORS_MAX_SHARDS) {
+            if (strncmp(entry->d_name, "model-", 6) == 0 &&
+                strstr(entry->d_name, ".safetensors") != NULL) {
+                snprintf(shard_names[n_shards], sizeof(shard_names[n_shards]),
+                         "%s", entry->d_name);
+                n_shards++;
+            }
+        }
+        closedir(dir);
+    }
+#endif
 
     if (n_shards == 0) {
         fprintf(stderr, "multi_safetensors_open: no safetensors files in %s\n", model_dir);

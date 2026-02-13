@@ -10,7 +10,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#ifndef _MSC_VER
 #include <pthread.h>
+#endif
 
 /* ========================================================================
  * Constants
@@ -171,6 +173,12 @@ typedef struct {
  * 'piece' is the decoded token string (UTF-8). */
 typedef void (*qwen_token_cb)(const char *piece, void *userdata);
 
+/* Per-token timestamp entry (used by qwen_get_token_timestamps) */
+typedef struct {
+    int byte_offset;    /* byte offset into result string where this token starts */
+    int audio_ms;       /* audio timestamp in milliseconds */
+} qwen_token_ts_t;
+
 /* ========================================================================
  * Main Context
  * ======================================================================== */
@@ -234,18 +242,37 @@ typedef struct {
     int n_force_prompt_tokens;
     int prompt_tokens_ready;       /* cache valid flag */
 
+    /* Per-token audio timestamp tracking (attention probing) */
+    int enc_kv_start;              /* KV cache position where encoder tokens begin */
+    int enc_kv_count;              /* number of encoder tokens in KV cache */
+    int last_peak_enc_pos;         /* KV position of peak attention (set by decoder) */
+    int ts_probe_layer;            /* which decoder layer to probe (-1 = last, default) */
+    int *token_audio_ms;           /* [token_ts_cap] audio ms per text token */
+    int *token_byte_offsets;       /* [token_ts_cap] byte offset into result string */
+    int token_ts_len;              /* filled count */
+    int token_ts_cap;              /* allocated capacity */
+    qwen_token_ts_t *token_ts_out; /* combined output buffer for qwen_get_token_timestamps */
+    int token_ts_out_cap;
+
     /* Per-run performance stats (populated by last transcription call) */
     double perf_total_ms;          /* end-to-end inference time in milliseconds */
     int perf_text_tokens;          /* emitted text tokens (after <asr_text>) */
     double perf_audio_ms;          /* input audio duration in milliseconds */
     double perf_encode_ms;         /* mel + encoder time in milliseconds */
     double perf_decode_ms;         /* decoder prefill + decode time in milliseconds */
+
+#ifdef USE_CUDA_KERNELS
+    /* GPU decoder context (full GPU forward pass with custom CUDA kernels).
+     * Non-NULL when CUBIN loaded successfully; NULL falls back to cuBLAS-only. */
+    void *gpu_dec_ctx;
+#endif
 } qwen_ctx_t;
 
 /* ========================================================================
  * Live Audio (incremental stdin streaming)
  * ======================================================================== */
 
+#ifndef _MSC_VER
 typedef struct {
     /* Written by reader thread under mutex */
     float *samples;
@@ -257,6 +284,10 @@ typedef struct {
     pthread_cond_t cond;
     pthread_t thread;
 } qwen_live_audio_t;
+#else
+/* Opaque on MSVC — live streaming requires pthreads (Linux only) */
+typedef struct qwen_live_audio_s qwen_live_audio_t;
+#endif
 
 /* ========================================================================
  * API Functions
@@ -301,6 +332,12 @@ char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_sample
  * The streaming loop waits for new data instead of terminating at EOF.
  * Tokens are emitted via the token callback as they become "fixed". */
 char *qwen_transcribe_stream_live(qwen_ctx_t *ctx, qwen_live_audio_t *live);
+
+/* After qwen_transcribe_audio(), get per-text-token audio timestamps.
+ * Returns array of timestamp entries (one per text token in result).
+ * Array is valid until next transcription call.
+ * Returns 0 on success, -1 if no timestamps available. */
+int qwen_get_token_timestamps(qwen_ctx_t *ctx, const qwen_token_ts_t **out_ts, int *out_count);
 
 /* ========================================================================
  * Internal Functions

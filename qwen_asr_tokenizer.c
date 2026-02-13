@@ -14,6 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _MSC_VER
+#define strdup _strdup
+#endif
+
 /* ========================================================================
  * GPT-2 Bytes-to-Unicode Mapping
  * ======================================================================== */
@@ -412,6 +416,10 @@ static int encode_bpe_word(const qwen_tokenizer_t *tok, const char *mapped, int 
 
 static int derive_merges_path(const char *vocab_path, char *out_path, size_t out_cap) {
     const char *slash = strrchr(vocab_path, '/');
+#ifdef _WIN32
+    const char *bslash = strrchr(vocab_path, '\\');
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+#endif
     if (!slash) {
         if (snprintf(out_path, out_cap, "merges.txt") >= (int)out_cap) return -1;
         return 0;
