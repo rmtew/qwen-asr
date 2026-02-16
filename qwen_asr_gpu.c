@@ -574,6 +574,17 @@ void qwen_gpu_print_stats(qwen_gpu_ctx_t *gpu) {
             gpu->vram_buffers / (1024.0 * 1024.0));
 }
 
+void qwen_gpu_get_stats(qwen_gpu_ctx_t *gpu, qwen_gpu_stats_t *stats) {
+    if (!stats) return;
+    memset(stats, 0, sizeof(*stats));
+    if (!gpu) return;
+    stats->n_weights = gpu->n_weights;
+    stats->n_weights_f32 = gpu->n_weights_f32;
+    stats->n_weights_f16 = gpu->n_weights_f16;
+    stats->vram_weights = gpu->vram_weights;
+    stats->vram_buffers = gpu->vram_buffers;
+}
+
 #endif /* USE_CUBLAS */
 
 /* ========================================================================

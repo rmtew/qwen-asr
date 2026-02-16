@@ -72,6 +72,18 @@ int qwen_gpu_weight_is_fp16(qwen_gpu_ctx_t *gpu, int handle);
 /* Print GPU memory usage stats to stderr. */
 void qwen_gpu_print_stats(qwen_gpu_ctx_t *gpu);
 
+/* GPU stats snapshot for per-model tracking. */
+typedef struct {
+    int n_weights;
+    int n_weights_f32;
+    int n_weights_f16;
+    size_t vram_weights;
+    size_t vram_buffers;
+} qwen_gpu_stats_t;
+
+/* Get current GPU stats. Safe to call with NULL gpu (zeroes out stats). */
+void qwen_gpu_get_stats(qwen_gpu_ctx_t *gpu, qwen_gpu_stats_t *stats);
+
 /* Get the cuBLAS handle (for use by GPU decoder context). */
 void *qwen_gpu_get_cublas_handle(qwen_gpu_ctx_t *gpu);
 
