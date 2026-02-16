@@ -48,19 +48,15 @@ struct qwen_gpu_ctx {
     size_t d_A_cap;     /* capacity in floats */
     size_t d_C_cap;
 
-    /* FP16 activation buffer (device) for mixed-precision GEMM.
-     * When weight is FP16, activations are converted F32->FP16 on CPU,
-     * uploaded to d_A_f16, and cublasGemmEx does FP16*FP16->F32. */
+    /* FP16 activation buffer (device) for CPU decoder GEMM offload path.
+     * Used by qwen_gpu_gemm / qwen_gpu_argmax_matvec when CUDA kernels
+     * are disabled (QWEN_NO_CUDA_KERNELS env var). */
     void *d_A_f16;
     size_t d_A_f16_cap; /* capacity in fp16 elements (uint16_t) */
 
-    /* Host staging buffer for F32->FP16 conversion */
+    /* Host staging buffer for F32->FP16 activation conversion */
     uint16_t *h_f16_buf;
     size_t h_f16_buf_cap; /* capacity in uint16_t elements */
-
-    /* Host staging buffer for F32 activation download (d2d FP16 GEMM path) */
-    float *h_f32_buf;
-    size_t h_f32_buf_cap; /* capacity in float elements */
 
     /* FP16 upload mode: when set, upload_weight_bf16 stores as FP16 */
     int fp16_mode;
@@ -226,7 +222,6 @@ void qwen_gpu_free(qwen_gpu_ctx_t *gpu) {
     if (gpu->d_A_f16) cudaFree(gpu->d_A_f16);
     if (gpu->d_W_dequant) cudaFree(gpu->d_W_dequant);
     free(gpu->h_f16_buf);
-    free(gpu->h_f32_buf);
     free(gpu->h_argmax_buf);
 
     cublasDestroy(gpu->handle);
