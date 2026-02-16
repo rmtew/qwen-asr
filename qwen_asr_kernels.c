@@ -1153,7 +1153,13 @@ void qwen_swiglu_multiply(float *out, const float *gate_up, int seq_len, int int
         .intermediate = intermediate
     };
 
-    if (tp.n_threads > 1 && seq_len >= 2 && intermediate >= 256) {
+    /* In-place mode (out == gate_up) has cross-position memory overlap:
+     * position s reads from [s*2*inter, (s+1)*2*inter) but writes to
+     * [s*inter, (s+1)*inter).  When parallelized, a later thread's write
+     * region overlaps an earlier thread's read region, causing a data race.
+     * Only parallelize the non-aliased (prefill with separate output) case. */
+    int alias_inplace = (out == gate_up);
+    if (tp.n_threads > 1 && seq_len >= 2 && intermediate >= 256 && !alias_inplace) {
         parallel_for(swiglu_worker, &task);
     } else {
         swiglu_worker(0, 1, &task);
