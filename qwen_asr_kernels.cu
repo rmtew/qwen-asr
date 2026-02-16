@@ -520,14 +520,23 @@ extern "C" __global__ void qwen_fp16_matvec_f32(float *out,
     }
     __syncthreads();
 
-    /* Block reduction (reuse shared memory) */
+    /* Block reduction: shared memory down to warp, then warp shuffle */
     sh[tid] = sum;
     __syncthreads();
-    for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+    for (int stride = (int)blockDim.x / 2; stride > 32; stride >>= 1) {
         if (tid < stride) sh[tid] += sh[tid + stride];
         __syncthreads();
     }
-    if (tid == 0) out[row] = sh[0];
+    /* Final warp: shuffle reduction (no barriers needed) */
+    if (tid < 32) {
+        float val = sh[tid] + sh[tid + 32];
+        val += __shfl_down_sync(0xFFFFFFFFu, val, 16);
+        val += __shfl_down_sync(0xFFFFFFFFu, val, 8);
+        val += __shfl_down_sync(0xFFFFFFFFu, val, 4);
+        val += __shfl_down_sync(0xFFFFFFFFu, val, 2);
+        val += __shfl_down_sync(0xFFFFFFFFu, val, 1);
+        if (tid == 0) out[row] = val;
+    }
 }
 
 /* ========================================================================
