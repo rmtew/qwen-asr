@@ -16,6 +16,9 @@
 #include "qwen_asr.h"
 #include "qwen_asr_kernels.h"
 #include "qwen_asr_safetensors.h"
+#ifdef USE_CUDA_KERNELS
+#include "qwen_asr_gpu.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -297,75 +300,93 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     window_starts[n_windows] = total_tokens;
 
 
-    /* ---- Transformer layers ---- */
-    float *x_norm = (float *)malloc(total_tokens * d_model * sizeof(float));
-    float *q = (float *)malloc(total_tokens * d_model * sizeof(float));
-    float *k = (float *)malloc(total_tokens * d_model * sizeof(float));
-    float *v = (float *)malloc(total_tokens * d_model * sizeof(float));
-    float *attn_out = (float *)malloc(total_tokens * d_model * sizeof(float));
-    float *proj_out = (float *)malloc(total_tokens * d_model * sizeof(float));
-    float *ffn_mid = (float *)malloc(total_tokens * ffn_dim * sizeof(float));
-    float *ffn_out = (float *)malloc(total_tokens * d_model * sizeof(float));
-
-    float scale = 1.0f / sqrtf((float)head_dim);
-
-    for (int layer = 0; layer < cfg->enc_layers; layer++) {
-        qwen_enc_layer_t *l = &enc->layers[layer];
-
-        /* ---- Self-attention ---- */
-        qwen_layer_norm(x_norm, x, l->attn_norm_weight, l->attn_norm_bias,
-                        total_tokens, d_model, 1e-5f);
-
-        qwen_linear(q, x_norm, l->wq_weight, l->wq_bias,
-                     total_tokens, d_model, d_model);
-        qwen_linear(k, x_norm, l->wk_weight, l->wk_bias,
-                     total_tokens, d_model, d_model);
-        qwen_linear(v, x_norm, l->wv_weight, l->wv_bias,
-                     total_tokens, d_model, d_model);
-
-        qwen_bidirectional_attention(attn_out, q, k, v,
-                                      total_tokens, n_heads, head_dim, scale,
-                                      window_starts, n_windows);
-
-        /* Output projection + residual */
-        qwen_linear(proj_out, attn_out, l->wo_weight, l->wo_bias,
-                     total_tokens, d_model, d_model);
-        qwen_add_inplace(x, proj_out, total_tokens * d_model);
-
-        /* ---- FFN ---- */
-        qwen_layer_norm(x_norm, x, l->ffn_norm_weight, l->ffn_norm_bias,
-                        total_tokens, d_model, 1e-5f);
-
-        /* GELU FFN: fc1 -> GELU -> fc2 */
-        qwen_linear(ffn_mid, x_norm, l->fc1_weight, l->fc1_bias,
-                     total_tokens, d_model, ffn_dim);
-        qwen_gelu(ffn_mid, total_tokens * ffn_dim);
-        qwen_linear(ffn_out, ffn_mid, l->fc2_weight, l->fc2_bias,
-                     total_tokens, ffn_dim, d_model);
-        qwen_add_inplace(x, ffn_out, total_tokens * d_model);
-
-    }
-
-    /* Final LayerNorm */
-    qwen_layer_norm(x, x, enc->ln_post_weight, enc->ln_post_bias,
-                    total_tokens, d_model, 1e-5f);
-
-    /* Projection: proj1 (GELU) -> proj2 */
-    float *proj_mid = (float *)malloc(total_tokens * d_model * sizeof(float));
-    qwen_linear(proj_mid, x, enc->proj1_weight, enc->proj1_bias,
-                 total_tokens, d_model, d_model);
-    qwen_gelu(proj_mid, total_tokens * d_model);
-
+    /* ---- Transformer layers + projection ---- */
     float *enc_output = (float *)malloc(total_tokens * output_dim * sizeof(float));
-    qwen_linear(enc_output, proj_mid, enc->proj2_weight, enc->proj2_bias,
-                 total_tokens, d_model, output_dim);
-    free(proj_mid);
 
-    /* Clean up */
-    free(x); free(x_norm); free(q); free(k); free(v);
-    free(attn_out); free(proj_out);
-    free(ffn_mid); free(ffn_out);
-    free(window_starts);
+#ifdef USE_CUDA_KERNELS
+    if (ctx->gpu_enc_ctx) {
+        /* GPU path: transformer layers + projection on device */
+        extern qwen_gpu_ctx_t *g_gpu_ctx;
+        int rc = qwen_gpu_encoder_forward(
+            (qwen_gpu_enc_ctx_t *)ctx->gpu_enc_ctx,
+            g_gpu_ctx, enc, cfg,
+            x, enc_output, total_tokens,
+            window_starts, n_windows);
+        free(x);
+        free(window_starts);
+        if (rc != 0) { free(enc_output); return NULL; }
+    } else
+#endif
+    {
+        /* CPU path */
+        float *x_norm = (float *)malloc(total_tokens * d_model * sizeof(float));
+        float *q = (float *)malloc(total_tokens * d_model * sizeof(float));
+        float *k = (float *)malloc(total_tokens * d_model * sizeof(float));
+        float *v = (float *)malloc(total_tokens * d_model * sizeof(float));
+        float *attn_out = (float *)malloc(total_tokens * d_model * sizeof(float));
+        float *proj_out = (float *)malloc(total_tokens * d_model * sizeof(float));
+        float *ffn_mid = (float *)malloc(total_tokens * ffn_dim * sizeof(float));
+        float *ffn_out = (float *)malloc(total_tokens * d_model * sizeof(float));
+
+        float scale = 1.0f / sqrtf((float)head_dim);
+
+        for (int layer = 0; layer < cfg->enc_layers; layer++) {
+            qwen_enc_layer_t *l = &enc->layers[layer];
+
+            /* ---- Self-attention ---- */
+            qwen_layer_norm(x_norm, x, l->attn_norm_weight, l->attn_norm_bias,
+                            total_tokens, d_model, 1e-5f);
+
+            qwen_linear(q, x_norm, l->wq_weight, l->wq_bias,
+                         total_tokens, d_model, d_model);
+            qwen_linear(k, x_norm, l->wk_weight, l->wk_bias,
+                         total_tokens, d_model, d_model);
+            qwen_linear(v, x_norm, l->wv_weight, l->wv_bias,
+                         total_tokens, d_model, d_model);
+
+            qwen_bidirectional_attention(attn_out, q, k, v,
+                                          total_tokens, n_heads, head_dim, scale,
+                                          window_starts, n_windows);
+
+            /* Output projection + residual */
+            qwen_linear(proj_out, attn_out, l->wo_weight, l->wo_bias,
+                         total_tokens, d_model, d_model);
+            qwen_add_inplace(x, proj_out, total_tokens * d_model);
+
+            /* ---- FFN ---- */
+            qwen_layer_norm(x_norm, x, l->ffn_norm_weight, l->ffn_norm_bias,
+                            total_tokens, d_model, 1e-5f);
+
+            /* GELU FFN: fc1 -> GELU -> fc2 */
+            qwen_linear(ffn_mid, x_norm, l->fc1_weight, l->fc1_bias,
+                         total_tokens, d_model, ffn_dim);
+            qwen_gelu(ffn_mid, total_tokens * ffn_dim);
+            qwen_linear(ffn_out, ffn_mid, l->fc2_weight, l->fc2_bias,
+                         total_tokens, ffn_dim, d_model);
+            qwen_add_inplace(x, ffn_out, total_tokens * d_model);
+
+        }
+
+        /* Final LayerNorm */
+        qwen_layer_norm(x, x, enc->ln_post_weight, enc->ln_post_bias,
+                        total_tokens, d_model, 1e-5f);
+
+        /* Projection: proj1 (GELU) -> proj2 */
+        float *proj_mid = (float *)malloc(total_tokens * d_model * sizeof(float));
+        qwen_linear(proj_mid, x, enc->proj1_weight, enc->proj1_bias,
+                     total_tokens, d_model, d_model);
+        qwen_gelu(proj_mid, total_tokens * d_model);
+
+        qwen_linear(enc_output, proj_mid, enc->proj2_weight, enc->proj2_bias,
+                     total_tokens, d_model, output_dim);
+        free(proj_mid);
+
+        /* Clean up CPU path */
+        free(x); free(x_norm); free(q); free(k); free(v);
+        free(attn_out); free(proj_out);
+        free(ffn_mid); free(ffn_out);
+        free(window_starts);
+    }
 
     *out_seq_len = total_tokens;
     return enc_output;

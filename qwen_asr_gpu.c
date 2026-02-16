@@ -411,6 +411,44 @@ void qwen_gpu_gemm(qwen_gpu_ctx_t *gpu, float *C_host,
     cudaMemcpy(C_host, gpu->d_C, C_size * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
+/* GPU Conv2D GEMM: out[c_out, sp] = W[c_out, ps] @ cols[ps, sp]
+ * W is pre-uploaded (by host_ptr lookup). cols is uploaded per-call.
+ * This differs from qwen_gpu_gemm() which assumes C = A @ W^T. */
+void qwen_gpu_conv2d_gemm(qwen_gpu_ctx_t *gpu, float *out_host,
+                            const float *cols_host, const float *weight_host_key,
+                            int c_out, int patch_size, int spatial_out) {
+    if (!gpu) return;
+    int wh = qwen_gpu_find_weight(gpu, weight_host_key);
+    if (wh < 0) return;
+    gpu_weight_entry_t *w = &gpu->weights[wh];
+
+    size_t col_size = (size_t)patch_size * spatial_out;
+    size_t out_size = (size_t)c_out * spatial_out;
+
+    if (ensure_device_buf(&gpu->d_A, &gpu->d_A_cap, col_size, &gpu->vram_buffers) != 0) return;
+    if (ensure_device_buf(&gpu->d_C, &gpu->d_C_cap, out_size, &gpu->vram_buffers) != 0) return;
+
+    /* Upload cols[ps, sp] to device */
+    cudaMemcpy(gpu->d_A, cols_host, col_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    /* Row-major trick for cublasSgemm:
+     * out_rm[c_out, sp] = W_rm[c_out, ps] @ cols_rm[ps, sp]
+     * ⟺ out_cm[sp, c_out] = cols_cm[sp, ps] × W_cm[ps, c_out]
+     * cublasSgemm(N, N, sp, c_out, ps, α, d_cols, sp, d_W, ps, β, d_out, sp) */
+    float alpha = 1.0f, beta = 0.0f;
+    cublasSgemm(gpu->handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                spatial_out, c_out, patch_size,
+                &alpha,
+                gpu->d_A, spatial_out,
+                (const float *)w->d_ptr, patch_size,
+                &beta,
+                gpu->d_C, spatial_out);
+
+    /* Download out[c_out, sp] */
+    cudaMemcpy(out_host, gpu->d_C, out_size * sizeof(float), cudaMemcpyDeviceToHost);
+}
+
 int qwen_gpu_argmax_matvec(qwen_gpu_ctx_t *gpu,
                             const float *x_host, int weight_handle,
                             int in_dim, int out_dim) {
@@ -534,6 +572,7 @@ void qwen_gpu_print_stats(qwen_gpu_ctx_t *gpu) {
 
 #include "qwen_asr.h"
 #include "qwen_asr_gpu.h"
+#include "qwen_asr_kernels.h"
 #include "qwen_asr_kernels_cubin.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -545,10 +584,11 @@ void qwen_gpu_print_stats(qwen_gpu_ctx_t *gpu) {
 extern int qwen_verbose;
 
 /* Number of CUDA kernel functions we load from the CUBIN */
-#define NUM_KERNELS 9
+#define NUM_KERNELS 12
 
 /* Kernel function indices */
 enum {
+    /* Decoder kernels */
     KF_RMS_NORM = 0,
     KF_RMS_NORM_PER_HEAD,
     KF_APPLY_ROPE_NEOX,
@@ -558,6 +598,10 @@ enum {
     KF_ATTN_GQA2,
     KF_ATTN_PROBE,
     KF_ARGMAX,
+    /* Encoder kernels */
+    KF_LAYER_NORM,
+    KF_GELU,
+    KF_BIAS_ADD,
 };
 
 static const char *kernel_names[NUM_KERNELS] = {
@@ -570,6 +614,9 @@ static const char *kernel_names[NUM_KERNELS] = {
     "qwen_attn_gqa2_f32",
     "qwen_attn_probe_f32",
     "qwen_argmax_f32",
+    "qwen_layer_norm_f32",
+    "qwen_gelu_f32",
+    "qwen_bias_add_f32",
 };
 
 struct qwen_gpu_dec_ctx {
@@ -1291,6 +1338,407 @@ int qwen_gpu_decoder_forward(qwen_gpu_dec_ctx_t *dctx,
     dctx->kv_synced_len = pos + 1;
 
     return *dctx->h_argmax_result;
+}
+
+/* ========================================================================
+ * Full GPU Encoder
+ *
+ * Keeps activations on GPU through the transformer layers.
+ * Custom CUDA kernels: LayerNorm, GELU, bias_add, add_inplace.
+ * cuBLAS handles all GEMM operations (device-to-device).
+ * Attention stays on CPU: QKV downloaded, attention computed, result uploaded.
+ * Conv2D stem stays on CPU (small, runs once per chunk).
+ * ======================================================================== */
+
+struct qwen_gpu_enc_ctx {
+    /* Kernel handles (borrowed from the shared CUBIN module) */
+    CUfunction k_layer_norm;
+    CUfunction k_gelu;
+    CUfunction k_bias_add;
+    CUfunction k_add_inplace;
+
+    /* Per-layer norm weights on GPU: weight[d_model] + bias[d_model] */
+    float **d_attn_norm_w;    /* [layers] -> device [d_model] */
+    float **d_attn_norm_b;    /* [layers] -> device [d_model] */
+    float **d_ffn_norm_w;     /* [layers] -> device [d_model] */
+    float **d_ffn_norm_b;     /* [layers] -> device [d_model] */
+
+    /* Per-layer bias vectors on GPU */
+    float **d_wq_bias;        /* [layers] -> device [d_model] */
+    float **d_wk_bias;        /* [layers] -> device [d_model] */
+    float **d_wv_bias;        /* [layers] -> device [d_model] */
+    float **d_wo_bias;        /* [layers] -> device [d_model] */
+    float **d_fc1_bias;       /* [layers] -> device [ffn_dim] */
+    float **d_fc2_bias;       /* [layers] -> device [d_model] */
+
+    /* Post-transformer norms and biases */
+    float *d_ln_post_w;       /* device [d_model] */
+    float *d_ln_post_b;       /* device [d_model] */
+    float *d_proj1_bias;      /* device [d_model] */
+    float *d_proj2_bias;      /* device [output_dim] */
+
+    /* Sequence-sized activation buffers (grown on demand) */
+    float *d_x;               /* [max_seq, d_model] */
+    float *d_x_norm;          /* [max_seq, d_model] */
+    float *d_qkv;             /* [max_seq, d_model] — reused for q, k, v, attn_out, proj */
+    float *d_ffn_mid;         /* [max_seq, ffn_dim] */
+    float *d_proj_mid;        /* [max_seq, max(d_model, output_dim)] */
+    int buf_max_seq;          /* current allocation size */
+
+    int n_layers;
+    size_t vram_norms;
+    size_t vram_activations;
+};
+
+qwen_gpu_enc_ctx_t *qwen_gpu_enc_init(qwen_gpu_ctx_t *gpu,
+                                        qwen_gpu_dec_ctx_t *dctx,
+                                        const qwen_encoder_t *enc,
+                                        const qwen_config_t *cfg) {
+    if (!gpu || !dctx || !enc || !cfg) return NULL;
+
+    qwen_gpu_enc_ctx_t *ectx = (qwen_gpu_enc_ctx_t *)calloc(1, sizeof(*ectx));
+    if (!ectx) return NULL;
+
+    /* Borrow kernel handles from the shared CUBIN (loaded by decoder) */
+    ectx->k_layer_norm  = dctx->kernels[KF_LAYER_NORM];
+    ectx->k_gelu        = dctx->kernels[KF_GELU];
+    ectx->k_bias_add    = dctx->kernels[KF_BIAS_ADD];
+    ectx->k_add_inplace = dctx->kernels[KF_ADD_INPLACE];
+
+    int layers = cfg->enc_layers;
+    int d_model = cfg->enc_d_model;
+    int ffn_dim = cfg->enc_ffn_dim;
+    int output_dim = cfg->enc_output_dim;
+    ectx->n_layers = layers;
+
+    /* Allocate pointer arrays */
+    ectx->d_attn_norm_w = (float **)calloc(layers, sizeof(float *));
+    ectx->d_attn_norm_b = (float **)calloc(layers, sizeof(float *));
+    ectx->d_ffn_norm_w  = (float **)calloc(layers, sizeof(float *));
+    ectx->d_ffn_norm_b  = (float **)calloc(layers, sizeof(float *));
+    ectx->d_wq_bias = (float **)calloc(layers, sizeof(float *));
+    ectx->d_wk_bias = (float **)calloc(layers, sizeof(float *));
+    ectx->d_wv_bias = (float **)calloc(layers, sizeof(float *));
+    ectx->d_wo_bias = (float **)calloc(layers, sizeof(float *));
+    ectx->d_fc1_bias = (float **)calloc(layers, sizeof(float *));
+    ectx->d_fc2_bias = (float **)calloc(layers, sizeof(float *));
+
+    /* Upload per-layer norm weights + biases */
+    size_t vram = 0;
+    size_t dm_bytes = d_model * sizeof(float);
+    size_t ff_bytes = ffn_dim * sizeof(float);
+
+    for (int i = 0; i < layers; i++) {
+        const qwen_enc_layer_t *l = &enc->layers[i];
+
+#define UPLOAD_VEC(dst, src, bytes) do {                              \
+    cudaMalloc((void **)&(dst), (bytes));                              \
+    cudaMemcpy((dst), (src), (bytes), cudaMemcpyHostToDevice);         \
+    vram += (bytes);                                                    \
+} while (0)
+
+        UPLOAD_VEC(ectx->d_attn_norm_w[i], l->attn_norm_weight, dm_bytes);
+        UPLOAD_VEC(ectx->d_attn_norm_b[i], l->attn_norm_bias, dm_bytes);
+        UPLOAD_VEC(ectx->d_ffn_norm_w[i], l->ffn_norm_weight, dm_bytes);
+        UPLOAD_VEC(ectx->d_ffn_norm_b[i], l->ffn_norm_bias, dm_bytes);
+        UPLOAD_VEC(ectx->d_wq_bias[i], l->wq_bias, dm_bytes);
+        UPLOAD_VEC(ectx->d_wk_bias[i], l->wk_bias, dm_bytes);
+        UPLOAD_VEC(ectx->d_wv_bias[i], l->wv_bias, dm_bytes);
+        UPLOAD_VEC(ectx->d_wo_bias[i], l->wo_bias, dm_bytes);
+        UPLOAD_VEC(ectx->d_fc1_bias[i], l->fc1_bias, ff_bytes);
+        UPLOAD_VEC(ectx->d_fc2_bias[i], l->fc2_bias, dm_bytes);
+    }
+
+    /* Post-transformer norms and biases */
+    UPLOAD_VEC(ectx->d_ln_post_w, enc->ln_post_weight, dm_bytes);
+    UPLOAD_VEC(ectx->d_ln_post_b, enc->ln_post_bias, dm_bytes);
+    UPLOAD_VEC(ectx->d_proj1_bias, enc->proj1_bias, dm_bytes);
+    UPLOAD_VEC(ectx->d_proj2_bias, enc->proj2_bias, output_dim * sizeof(float));
+
+#undef UPLOAD_VEC
+
+    ectx->vram_norms = vram;
+    if (qwen_verbose >= 1)
+        fprintf(stderr, "GPU enc: norm/bias weights uploaded (%.1f KB)\n", vram / 1024.0);
+
+    return ectx;
+}
+
+/* Ensure activation buffers are large enough for seq tokens */
+static int enc_ensure_buffers(qwen_gpu_enc_ctx_t *ectx,
+                               const qwen_config_t *cfg, int seq) {
+    if (seq <= ectx->buf_max_seq) return 0;
+
+    int d_model = cfg->enc_d_model;
+    int ffn_dim = cfg->enc_ffn_dim;
+    int output_dim = cfg->enc_output_dim;
+    int proj_dim = d_model > output_dim ? d_model : output_dim;
+
+    /* Free old buffers */
+    if (ectx->d_x) cudaFree(ectx->d_x);
+    if (ectx->d_x_norm) cudaFree(ectx->d_x_norm);
+    if (ectx->d_qkv) cudaFree(ectx->d_qkv);
+    if (ectx->d_ffn_mid) cudaFree(ectx->d_ffn_mid);
+    if (ectx->d_proj_mid) cudaFree(ectx->d_proj_mid);
+
+    size_t vram = 0;
+#define ALLOC_E(ptr, count) do {                                          \
+    size_t bytes = (size_t)(count) * sizeof(float);                        \
+    cudaError_t e = cudaMalloc((void **)&(ptr), bytes);                    \
+    if (e != cudaSuccess) {                                                \
+        fprintf(stderr, "GPU enc: alloc failed for " #ptr ": %s\n",       \
+                cudaGetErrorString(e));                                     \
+        return -1;                                                         \
+    }                                                                      \
+    vram += bytes;                                                         \
+} while (0)
+
+    ALLOC_E(ectx->d_x,       (size_t)seq * proj_dim);  /* proj_dim >= d_model for proj2 output */
+    ALLOC_E(ectx->d_x_norm,  (size_t)seq * d_model);
+    ALLOC_E(ectx->d_qkv,     (size_t)seq * d_model);
+    ALLOC_E(ectx->d_ffn_mid, (size_t)seq * ffn_dim);
+    ALLOC_E(ectx->d_proj_mid,(size_t)seq * proj_dim);
+#undef ALLOC_E
+
+    ectx->buf_max_seq = seq;
+    ectx->vram_activations = vram;
+
+    if (qwen_verbose >= 2)
+        fprintf(stderr, "GPU enc: activation buffers for %d tokens (%.1f MB)\n",
+                seq, vram / (1024.0 * 1024.0));
+    return 0;
+}
+
+void qwen_gpu_enc_free(qwen_gpu_enc_ctx_t *ectx) {
+    if (!ectx) return;
+
+    /* Per-layer norm/bias */
+    for (int i = 0; i < ectx->n_layers; i++) {
+        if (ectx->d_attn_norm_w && ectx->d_attn_norm_w[i]) cudaFree(ectx->d_attn_norm_w[i]);
+        if (ectx->d_attn_norm_b && ectx->d_attn_norm_b[i]) cudaFree(ectx->d_attn_norm_b[i]);
+        if (ectx->d_ffn_norm_w && ectx->d_ffn_norm_w[i]) cudaFree(ectx->d_ffn_norm_w[i]);
+        if (ectx->d_ffn_norm_b && ectx->d_ffn_norm_b[i]) cudaFree(ectx->d_ffn_norm_b[i]);
+        if (ectx->d_wq_bias && ectx->d_wq_bias[i]) cudaFree(ectx->d_wq_bias[i]);
+        if (ectx->d_wk_bias && ectx->d_wk_bias[i]) cudaFree(ectx->d_wk_bias[i]);
+        if (ectx->d_wv_bias && ectx->d_wv_bias[i]) cudaFree(ectx->d_wv_bias[i]);
+        if (ectx->d_wo_bias && ectx->d_wo_bias[i]) cudaFree(ectx->d_wo_bias[i]);
+        if (ectx->d_fc1_bias && ectx->d_fc1_bias[i]) cudaFree(ectx->d_fc1_bias[i]);
+        if (ectx->d_fc2_bias && ectx->d_fc2_bias[i]) cudaFree(ectx->d_fc2_bias[i]);
+    }
+    free(ectx->d_attn_norm_w); free(ectx->d_attn_norm_b);
+    free(ectx->d_ffn_norm_w); free(ectx->d_ffn_norm_b);
+    free(ectx->d_wq_bias); free(ectx->d_wk_bias);
+    free(ectx->d_wv_bias); free(ectx->d_wo_bias);
+    free(ectx->d_fc1_bias); free(ectx->d_fc2_bias);
+
+    if (ectx->d_ln_post_w) cudaFree(ectx->d_ln_post_w);
+    if (ectx->d_ln_post_b) cudaFree(ectx->d_ln_post_b);
+    if (ectx->d_proj1_bias) cudaFree(ectx->d_proj1_bias);
+    if (ectx->d_proj2_bias) cudaFree(ectx->d_proj2_bias);
+
+    /* Activation buffers */
+    if (ectx->d_x) cudaFree(ectx->d_x);
+    if (ectx->d_x_norm) cudaFree(ectx->d_x_norm);
+    if (ectx->d_qkv) cudaFree(ectx->d_qkv);
+    if (ectx->d_ffn_mid) cudaFree(ectx->d_ffn_mid);
+    if (ectx->d_proj_mid) cudaFree(ectx->d_proj_mid);
+
+    free(ectx);
+}
+
+/* GPU encoder transformer layers forward pass.
+ * x_host: [seq, d_model] input (post conv2d stem, with position embeddings).
+ * enc_output_host: [seq, output_dim] output (caller allocates).
+ * Attention is computed on CPU (QKV downloaded, result uploaded). */
+int qwen_gpu_encoder_forward(qwen_gpu_enc_ctx_t *ectx,
+                               qwen_gpu_ctx_t *gpu,
+                               const qwen_encoder_t *enc,
+                               const qwen_config_t *cfg,
+                               float *x_host,
+                               float *enc_output_host,
+                               int seq,
+                               const int *window_starts,
+                               int n_windows) {
+    if (!ectx || !gpu || !enc || !cfg) return -1;
+
+    cublasHandle_t cblas = (cublasHandle_t)qwen_gpu_get_cublas_handle(gpu);
+    int d_model = cfg->enc_d_model;
+    int n_heads = cfg->enc_heads;
+    int head_dim = cfg->enc_head_dim;
+    int ffn_dim = cfg->enc_ffn_dim;
+    int output_dim = cfg->enc_output_dim;
+    float eps = 1e-5f;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    /* Ensure buffers */
+    if (enc_ensure_buffers(ectx, cfg, seq) != 0) return -1;
+
+    size_t x_bytes = (size_t)seq * d_model * sizeof(float);
+    size_t ffn_bytes = (size_t)seq * ffn_dim * sizeof(float);
+
+    /* Upload x to device */
+    cudaMemcpy(ectx->d_x, x_host, x_bytes, cudaMemcpyHostToDevice);
+
+    /* CPU-side buffers for attention (reused across layers) */
+    float *h_q = (float *)malloc(x_bytes);
+    float *h_k = (float *)malloc(x_bytes);
+    float *h_v = (float *)malloc(x_bytes);
+    float *h_attn_out = (float *)malloc(x_bytes);
+
+    for (int layer = 0; layer < cfg->enc_layers; layer++) {
+        const qwen_enc_layer_t *l = &enc->layers[layer];
+
+        /* --- Pre-attention LayerNorm (device) --- */
+        {
+            void *args[] = {
+                &ectx->d_x_norm, &ectx->d_x,
+                &ectx->d_attn_norm_w[layer], &ectx->d_attn_norm_b[layer],
+                &seq, &d_model, &eps
+            };
+            launch_kernel(ectx->k_layer_norm,
+                          (unsigned)seq, 1, 1, 256, 1, 1, 0, args);
+        }
+
+        /* --- Q projection (device GEMM + device bias add) --- */
+        {
+            int wq_h = qwen_gpu_find_weight(gpu, l->wq_weight);
+            float *d_wq = qwen_gpu_get_weight_ptr(gpu, wq_h);
+            gpu_gemm_d2d(cblas, ectx->d_qkv, ectx->d_x_norm, d_wq, seq, d_model, d_model);
+            void *bias_args[] = { &ectx->d_qkv, &ectx->d_wq_bias[layer], &seq, &d_model };
+            launch_kernel(ectx->k_bias_add, (unsigned)seq, 1, 1, 256, 1, 1, 0, bias_args);
+        }
+        /* Download Q to CPU for attention */
+        cudaMemcpy(h_q, ectx->d_qkv, x_bytes, cudaMemcpyDeviceToHost);
+
+        /* --- K projection --- */
+        {
+            int wk_h = qwen_gpu_find_weight(gpu, l->wk_weight);
+            float *d_wk = qwen_gpu_get_weight_ptr(gpu, wk_h);
+            gpu_gemm_d2d(cblas, ectx->d_qkv, ectx->d_x_norm, d_wk, seq, d_model, d_model);
+            void *bias_args[] = { &ectx->d_qkv, &ectx->d_wk_bias[layer], &seq, &d_model };
+            launch_kernel(ectx->k_bias_add, (unsigned)seq, 1, 1, 256, 1, 1, 0, bias_args);
+        }
+        cudaMemcpy(h_k, ectx->d_qkv, x_bytes, cudaMemcpyDeviceToHost);
+
+        /* --- V projection --- */
+        {
+            int wv_h = qwen_gpu_find_weight(gpu, l->wv_weight);
+            float *d_wv = qwen_gpu_get_weight_ptr(gpu, wv_h);
+            gpu_gemm_d2d(cblas, ectx->d_qkv, ectx->d_x_norm, d_wv, seq, d_model, d_model);
+            void *bias_args[] = { &ectx->d_qkv, &ectx->d_wv_bias[layer], &seq, &d_model };
+            launch_kernel(ectx->k_bias_add, (unsigned)seq, 1, 1, 256, 1, 1, 0, bias_args);
+        }
+        cudaMemcpy(h_v, ectx->d_qkv, x_bytes, cudaMemcpyDeviceToHost);
+
+        /* --- Bidirectional windowed attention (CPU) --- */
+        qwen_bidirectional_attention(h_attn_out, h_q, h_k, h_v,
+                                      seq, n_heads, head_dim, scale,
+                                      window_starts, n_windows);
+
+        /* Upload attention output, run output projection on device */
+        cudaMemcpy(ectx->d_qkv, h_attn_out, x_bytes, cudaMemcpyHostToDevice);
+
+        /* --- Output projection + bias + residual (device) --- */
+        {
+            int wo_h = qwen_gpu_find_weight(gpu, l->wo_weight);
+            float *d_wo = qwen_gpu_get_weight_ptr(gpu, wo_h);
+            gpu_gemm_d2d(cblas, ectx->d_x_norm, ectx->d_qkv, d_wo, seq, d_model, d_model);
+            void *bias_args[] = { &ectx->d_x_norm, &ectx->d_wo_bias[layer], &seq, &d_model };
+            launch_kernel(ectx->k_bias_add, (unsigned)seq, 1, 1, 256, 1, 1, 0, bias_args);
+
+            int n = seq * d_model;
+            void *add_args[] = { &ectx->d_x, &ectx->d_x_norm, &n };
+            launch_kernel(ectx->k_add_inplace,
+                          ((unsigned)n + 255) / 256, 1, 1, 256, 1, 1, 0, add_args);
+        }
+
+        /* --- Pre-FFN LayerNorm (device) --- */
+        {
+            void *args[] = {
+                &ectx->d_x_norm, &ectx->d_x,
+                &ectx->d_ffn_norm_w[layer], &ectx->d_ffn_norm_b[layer],
+                &seq, &d_model, &eps
+            };
+            launch_kernel(ectx->k_layer_norm,
+                          (unsigned)seq, 1, 1, 256, 1, 1, 0, args);
+        }
+
+        /* --- FFN: fc1 + bias + GELU (device) --- */
+        {
+            int wfc1_h = qwen_gpu_find_weight(gpu, l->fc1_weight);
+            float *d_wfc1 = qwen_gpu_get_weight_ptr(gpu, wfc1_h);
+            gpu_gemm_d2d(cblas, ectx->d_ffn_mid, ectx->d_x_norm, d_wfc1, seq, d_model, ffn_dim);
+
+            void *bias_args[] = { &ectx->d_ffn_mid, &ectx->d_fc1_bias[layer], &seq, &ffn_dim };
+            launch_kernel(ectx->k_bias_add, (unsigned)seq, 1, 1, 256, 1, 1, 0, bias_args);
+
+            int n_gelu = seq * ffn_dim;
+            void *gelu_args[] = { &ectx->d_ffn_mid, &n_gelu };
+            launch_kernel(ectx->k_gelu,
+                          ((unsigned)n_gelu + 255) / 256, 1, 1, 256, 1, 1, 0, gelu_args);
+        }
+
+        /* --- fc2 + bias + residual (device) --- */
+        {
+            int wfc2_h = qwen_gpu_find_weight(gpu, l->fc2_weight);
+            float *d_wfc2 = qwen_gpu_get_weight_ptr(gpu, wfc2_h);
+            /* Reuse d_x_norm as temp for fc2 output */
+            gpu_gemm_d2d(cblas, ectx->d_x_norm, ectx->d_ffn_mid, d_wfc2, seq, ffn_dim, d_model);
+
+            void *bias_args[] = { &ectx->d_x_norm, &ectx->d_fc2_bias[layer], &seq, &d_model };
+            launch_kernel(ectx->k_bias_add, (unsigned)seq, 1, 1, 256, 1, 1, 0, bias_args);
+
+            int n = seq * d_model;
+            void *add_args[] = { &ectx->d_x, &ectx->d_x_norm, &n };
+            launch_kernel(ectx->k_add_inplace,
+                          ((unsigned)n + 255) / 256, 1, 1, 256, 1, 1, 0, add_args);
+        }
+    }
+
+    free(h_q); free(h_k); free(h_v); free(h_attn_out);
+
+    /* --- Final LayerNorm (in-place via d_x_norm then copy back) --- */
+    {
+        void *args[] = {
+            &ectx->d_x, &ectx->d_x,
+            &ectx->d_ln_post_w, &ectx->d_ln_post_b,
+            &seq, &d_model, &eps
+        };
+        launch_kernel(ectx->k_layer_norm,
+                      (unsigned)seq, 1, 1, 256, 1, 1, 0, args);
+    }
+
+    /* --- proj1 + bias + GELU (device) --- */
+    {
+        int wp1_h = qwen_gpu_find_weight(gpu, enc->proj1_weight);
+        float *d_wp1 = qwen_gpu_get_weight_ptr(gpu, wp1_h);
+        gpu_gemm_d2d(cblas, ectx->d_proj_mid, ectx->d_x, d_wp1, seq, d_model, d_model);
+
+        void *bias_args[] = { &ectx->d_proj_mid, &ectx->d_proj1_bias, &seq, &d_model };
+        launch_kernel(ectx->k_bias_add, (unsigned)seq, 1, 1, 256, 1, 1, 0, bias_args);
+
+        int n_gelu = seq * d_model;
+        void *gelu_args[] = { &ectx->d_proj_mid, &n_gelu };
+        launch_kernel(ectx->k_gelu,
+                      ((unsigned)n_gelu + 255) / 256, 1, 1, 256, 1, 1, 0, gelu_args);
+    }
+
+    /* --- proj2 + bias (device) -> download result --- */
+    {
+        int wp2_h = qwen_gpu_find_weight(gpu, enc->proj2_weight);
+        float *d_wp2 = qwen_gpu_get_weight_ptr(gpu, wp2_h);
+        /* Reuse d_x as output buffer (may be larger than needed, that's fine) */
+        gpu_gemm_d2d(cblas, ectx->d_x, ectx->d_proj_mid, d_wp2, seq, d_model, output_dim);
+
+        void *bias_args[] = { &ectx->d_x, &ectx->d_proj2_bias, &seq, &output_dim };
+        launch_kernel(ectx->k_bias_add, (unsigned)seq, 1, 1, 256, 1, 1, 0, bias_args);
+
+        /* Download final encoder output */
+        cudaMemcpy(enc_output_host, ectx->d_x,
+                   (size_t)seq * output_dim * sizeof(float), cudaMemcpyDeviceToHost);
+    }
+
+    return 0;
 }
 
 #endif /* USE_CUDA_KERNELS */

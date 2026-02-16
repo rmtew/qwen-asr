@@ -799,6 +799,11 @@ void qwen_conv2d(float *out, const float *in, const float *weight, const float *
     im2col(in, cols, c_in, h_in, w_in, kh, kw, stride, padding, h_out, w_out);
 
     /* GEMM: weight[c_out, patch_size] @ cols[patch_size, spatial_out] = out[c_out, spatial_out] */
+#ifdef USE_CUBLAS
+    if (g_gpu_ctx && qwen_gpu_find_weight(g_gpu_ctx, weight) >= 0) {
+        qwen_gpu_conv2d_gemm(g_gpu_ctx, out, cols, weight, c_out, patch_size, spatial_out);
+    } else
+#endif
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 c_out, spatial_out, patch_size,

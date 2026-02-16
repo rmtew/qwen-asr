@@ -1,11 +1,11 @@
 /*
- * qwen_asr_kernels.cu - CUDA kernels for Qwen3-ASR decoder forward pass
+ * qwen_asr_kernels.cu - CUDA kernels for Qwen3-ASR decoder & encoder
  *
  * Compiled to CUBIN via nvcc, embedded as C byte-array, loaded via CUDA
  * Driver API (cuModuleLoadData). All functions are extern "C" for driver API
  * compatibility. Adapted from voxtral.c CUDA kernels where noted.
  *
- * Kernel inventory:
+ * Kernel inventory (decoder):
  *   qwen_rms_norm_f32        - RMSNorm (multi-row)
  *   qwen_rms_norm_per_head_f32 - Per-head RMSNorm (in-place, one block per head)
  *   qwen_apply_rope_neox_f32 - NeoX split-half RoPE
@@ -15,6 +15,11 @@
  *   qwen_attn_gqa2_f32       - GQA 2:1 causal attention (online softmax)
  *   qwen_attn_probe_f32      - Timestamp alignment probe (attention argmax)
  *   qwen_argmax_f32          - Single-block argmax reduction
+ *
+ * Kernel inventory (encoder):
+ *   qwen_layer_norm_f32      - LayerNorm with bias (multi-row)
+ *   qwen_gelu_f32            - GELU activation (element-wise)
+ *   qwen_bias_add_f32        - Row-broadcasted bias add
  */
 
 #include <stdint.h>
@@ -413,4 +418,93 @@ extern "C" __global__ void qwen_argmax_f32(int *out_idx,
     }
 
     if (tid == 0) out_idx[0] = sh_idx[0];
+}
+
+/* ========================================================================
+ * Encoder kernels
+ * ======================================================================== */
+
+/* ========================================================================
+ * qwen_layer_norm_f32 - LayerNorm with bias (encoder)
+ *
+ * out[r,i] = (x[r,i] - mean) / sqrt(var + eps) * weight[i] + bias[i]
+ * Grid: rows, Block: 256
+ * ======================================================================== */
+
+extern "C" __global__ void qwen_layer_norm_f32(float *out,
+                                                const float *x,
+                                                const float *weight,
+                                                const float *bias,
+                                                int rows,
+                                                int hidden,
+                                                float eps) {
+    int r = (int)blockIdx.x;
+    if (r >= rows) return;
+
+    const float *x_row = x + (size_t)r * (size_t)hidden;
+    float *o_row = out + (size_t)r * (size_t)hidden;
+
+    __shared__ float sh[256];
+
+    /* Pass 1: compute mean */
+    float sum = 0.0f;
+    for (int i = (int)threadIdx.x; i < hidden; i += (int)blockDim.x)
+        sum += x_row[i];
+    sh[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride) sh[threadIdx.x] += sh[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float mean = sh[0] / (float)hidden;
+
+    /* Pass 2: compute variance */
+    float var_sum = 0.0f;
+    for (int i = (int)threadIdx.x; i < hidden; i += (int)blockDim.x) {
+        float d = x_row[i] - mean;
+        var_sum += d * d;
+    }
+    sh[threadIdx.x] = var_sum;
+    __syncthreads();
+    for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride) sh[threadIdx.x] += sh[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(sh[0] / (float)hidden + eps);
+
+    /* Normalize, scale, bias */
+    for (int i = (int)threadIdx.x; i < hidden; i += (int)blockDim.x)
+        o_row[i] = (x_row[i] - mean) * inv_std * weight[i] + bias[i];
+}
+
+/* ========================================================================
+ * qwen_gelu_f32 - GELU activation (element-wise, in-place)
+ *
+ * x[i] = x[i] * 0.5 * (1 + erf(x[i] / sqrt(2)))
+ * Grid: ceil(n/256), Block: 256
+ * ======================================================================== */
+
+extern "C" __global__ void qwen_gelu_f32(float *x, int n) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n) return;
+    float v = x[idx];
+    x[idx] = v * 0.5f * (1.0f + erff(v * 0.7071067811865476f));
+}
+
+/* ========================================================================
+ * qwen_bias_add_f32 - Row-broadcasted bias add (in-place)
+ *
+ * out[r * cols + c] += bias[c]  for all rows
+ * Grid: rows, Block: 256
+ * ======================================================================== */
+
+extern "C" __global__ void qwen_bias_add_f32(float *out,
+                                              const float *bias,
+                                              int rows,
+                                              int cols) {
+    int r = (int)blockIdx.x;
+    if (r >= rows) return;
+    float *row = out + (size_t)r * (size_t)cols;
+    for (int c = (int)threadIdx.x; c < cols; c += (int)blockDim.x)
+        row[c] += bias[c];
 }

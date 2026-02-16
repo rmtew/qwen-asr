@@ -265,6 +265,9 @@ typedef struct {
     /* GPU decoder context (full GPU forward pass with custom CUDA kernels).
      * Non-NULL when CUBIN loaded successfully; NULL falls back to cuBLAS-only. */
     void *gpu_dec_ctx;
+    /* GPU encoder context (transformer layers on GPU with custom kernels).
+     * Non-NULL when GPU decoder context exists (shares CUBIN). */
+    void *gpu_enc_ctx;
 #endif
 } qwen_ctx_t;
 

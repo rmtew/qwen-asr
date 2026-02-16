@@ -49,6 +49,12 @@ void qwen_gpu_gemm(qwen_gpu_ctx_t *gpu, float *C_host,
                    const float *A_host, int weight_handle,
                    int M, int K, int N);
 
+/* GPU Conv2D GEMM: out[c_out, sp] = W[c_out, ps] @ cols[ps, sp]
+ * W is looked up on GPU by host pointer. cols is uploaded per-call. */
+void qwen_gpu_conv2d_gemm(qwen_gpu_ctx_t *gpu, float *out_host,
+                            const float *cols_host, const float *weight_host_key,
+                            int c_out, int patch_size, int spatial_out);
+
 /* GPU matvec + argmax: computes W[out_dim,in_dim] @ x[in_dim] and returns
  * the index of the maximum element. Used for decoder lm_head. */
 int qwen_gpu_argmax_matvec(qwen_gpu_ctx_t *gpu,
@@ -88,6 +94,7 @@ void *qwen_gpu_get_cublas_handle(qwen_gpu_ctx_t *gpu);
  * These are structs underlying the typedefs in qwen_asr.h. Callers that
  * include qwen_asr.h before this header get the full definitions. */
 typedef struct qwen_gpu_dec_ctx qwen_gpu_dec_ctx_t;
+typedef struct qwen_gpu_enc_ctx qwen_gpu_enc_ctx_t;
 
 /* Create GPU decoder context. Loads CUBIN, allocates device buffers.
  * Returns NULL if CUBIN loading fails (arch mismatch, etc). */
@@ -140,6 +147,42 @@ int qwen_gpu_kv_cache_sync(qwen_gpu_dec_ctx_t *dctx,
                             const qwen_config_t *cfg,
                             const float *cpu_kv_k, const float *cpu_kv_v,
                             int cpu_max, int cpu_len);
+
+/* ========================================================================
+ * Full GPU Encoder (USE_CUDA_KERNELS)
+ *
+ * Keeps activations on GPU through the transformer layers.
+ * Custom CUDA kernels: LayerNorm, GELU, bias_add, add_inplace.
+ * cuBLAS handles all GEMM operations (device-to-device).
+ * Attention computed on CPU (QKV downloaded, result uploaded).
+ * Conv2D stem stays on CPU (small data, runs once per chunk).
+ * ======================================================================== */
+
+/* Create GPU encoder context. Borrows kernel handles from the decoder's
+ * CUBIN module, uploads per-layer norm/bias weights.
+ * Returns NULL on failure. */
+qwen_gpu_enc_ctx_t *qwen_gpu_enc_init(qwen_gpu_ctx_t *gpu,
+                                        qwen_gpu_dec_ctx_t *dctx,
+                                        const qwen_encoder_t *enc,
+                                        const qwen_config_t *cfg);
+
+/* Free GPU encoder context and all device buffers. */
+void qwen_gpu_enc_free(qwen_gpu_enc_ctx_t *ectx);
+
+/* GPU encoder transformer forward pass.
+ * x_host: [seq, d_model] input (post conv2d stem + position embeddings).
+ * enc_output_host: [seq, output_dim] output (caller allocates).
+ * window_starts[n_windows+1]: attention window boundaries.
+ * Returns 0 on success. */
+int qwen_gpu_encoder_forward(qwen_gpu_enc_ctx_t *ectx,
+                               qwen_gpu_ctx_t *gpu,
+                               const qwen_encoder_t *enc,
+                               const qwen_config_t *cfg,
+                               float *x_host,
+                               float *enc_output_host,
+                               int seq,
+                               const int *window_starts,
+                               int n_windows);
 
 #endif /* USE_CUDA_KERNELS */
 

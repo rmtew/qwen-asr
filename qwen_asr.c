@@ -219,7 +219,18 @@ static void gpu_upload_encoder_weights(qwen_gpu_ctx_t *gpu,
     int conv_proj = cfg->enc_conv_proj_dim;
     int n = 0;
 
-    /* Conv output projection (skip conv stem -- small, uses NN layout) */
+    /* Conv2D stem weights (im2col GEMM on GPU) */
+    if (enc->conv1_weight)
+        n += (qwen_gpu_upload_weight_f32(gpu, enc->conv1_weight,
+              QWEN_CONV_HIDDEN, 1 * QWEN_CONV_KERNEL * QWEN_CONV_KERNEL) == 0);
+    if (enc->conv2_weight)
+        n += (qwen_gpu_upload_weight_f32(gpu, enc->conv2_weight,
+              QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN * QWEN_CONV_KERNEL * QWEN_CONV_KERNEL) == 0);
+    if (enc->conv3_weight)
+        n += (qwen_gpu_upload_weight_f32(gpu, enc->conv3_weight,
+              QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN * QWEN_CONV_KERNEL * QWEN_CONV_KERNEL) == 0);
+
+    /* Conv output projection */
     if (enc->conv_out_weight)
         n += (qwen_gpu_upload_weight_f32(gpu, enc->conv_out_weight, d, conv_proj) == 0);
 
@@ -341,6 +352,15 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
                 ctx->gpu_dec_ctx = dctx;
                 if (qwen_verbose >= 1)
                     fprintf(stderr, "GPU dec: full GPU decoder enabled\n");
+
+                /* Initialize GPU encoder (shares CUBIN with decoder) */
+                qwen_gpu_enc_ctx_t *ectx = qwen_gpu_enc_init(
+                    g_gpu_ctx, dctx, &ctx->encoder, &ctx->config);
+                if (ectx) {
+                    ctx->gpu_enc_ctx = ectx;
+                    if (qwen_verbose >= 1)
+                        fprintf(stderr, "GPU enc: full GPU encoder enabled\n");
+                }
             } else {
                 if (qwen_verbose >= 1)
                     fprintf(stderr, "GPU dec: CUBIN load failed, using cuBLAS-only fallback\n");
@@ -375,6 +395,10 @@ void qwen_free(qwen_ctx_t *ctx) {
     if (!ctx) return;
 
 #ifdef USE_CUDA_KERNELS
+    if (ctx->gpu_enc_ctx) {
+        qwen_gpu_enc_free((qwen_gpu_enc_ctx_t *)ctx->gpu_enc_ctx);
+        ctx->gpu_enc_ctx = NULL;
+    }
     if (ctx->gpu_dec_ctx) {
         qwen_gpu_dec_free((qwen_gpu_dec_ctx_t *)ctx->gpu_dec_ctx);
         ctx->gpu_dec_ctx = NULL;
