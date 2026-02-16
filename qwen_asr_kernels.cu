@@ -15,6 +15,8 @@
  *   qwen_attn_gqa2_f32       - GQA 2:1 causal attention (online softmax)
  *   qwen_attn_probe_f32      - Timestamp alignment probe (attention argmax)
  *   qwen_argmax_f32          - Single-block argmax reduction
+ *   qwen_f16_to_f32          - On-device FP16→F32 weight dequantization
+ *   qwen_fp16_matvec_f32     - Fused FP16-weight matvec (no scratch buffer)
  *
  * Kernel inventory (encoder):
  *   qwen_layer_norm_f32      - LayerNorm with bias (multi-row)
@@ -418,6 +420,114 @@ extern "C" __global__ void qwen_argmax_f32(int *out_idx,
     }
 
     if (tid == 0) out_idx[0] = sh_idx[0];
+}
+
+/* ========================================================================
+ * qwen_f16_to_f32 - On-device FP16 to F32 dequantization
+ *
+ * Converts FP16 weight data to F32 in a scratch buffer before GEMM.
+ * Allows storing weights as FP16 (VRAM savings) while running standard
+ * cublasSgemm (F32×F32) with no activation precision loss.
+ * Grid: ceil(n/256), Block: 256
+ * ======================================================================== */
+
+extern "C" __global__ void qwen_f16_to_f32(float *out,
+                                            const unsigned short *in,
+                                            int n) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n) return;
+
+    /* FP16 -> F32 bit manipulation (no cuda_fp16.h dependency) */
+    unsigned short h = in[idx];
+    unsigned int sign = ((unsigned int)(h >> 15)) << 31;
+    unsigned int exp  = (h >> 10) & 0x1Fu;
+    unsigned int mant = h & 0x3FFu;
+
+    unsigned int f;
+    if (exp == 0u) {
+        f = sign; /* ±zero (subnormals negligible for weight data) */
+    } else if (exp == 31u) {
+        f = sign | 0x7F800000u | (mant << 13); /* Inf/NaN */
+    } else {
+        f = sign | ((exp + 112u) << 23) | (mant << 13); /* normal: rebias 15→127 */
+    }
+    out[idx] = __uint_as_float(f);
+}
+
+/* ========================================================================
+ * qwen_fp16_matvec_f32 - Fused FP16-weight matrix-vector product
+ *
+ * out[row] = sum_i( fp16_to_f32(W[row,i]) * A[i] )  for row in [0,N)
+ *
+ * Reads FP16 weights via 128-bit uint4 loads (8 FP16 values per load),
+ * converts to F32 in registers, multiplies by activation cached in shared
+ * memory (loaded via 128-bit float4 loads). No scratch buffer needed —
+ * bandwidth is 2 bytes/weight element (half of F32) at 100% coalescing.
+ *
+ * Grid: N (one block per output element), Block: 256
+ * Shared memory: K * sizeof(float) for activation caching
+ * Requires: K divisible by 8 (true for all model dimensions)
+ * ======================================================================== */
+
+/* Branchless FP16→F32 for weight data (no Inf/NaN expected, zero handled) */
+static __device__ __forceinline__ float fp16_w(unsigned short h) {
+    unsigned int sign = ((unsigned int)(h >> 15)) << 31;
+    unsigned int exp  = (h >> 10) & 0x1Fu;
+    unsigned int mant = h & 0x3FFu;
+    unsigned int f = sign | ((exp + 112u) << 23) | (mant << 13);
+    return __uint_as_float((exp != 0u) ? f : sign);
+}
+
+extern "C" __global__ void qwen_fp16_matvec_f32(float *out,
+                                                  const unsigned short *W,
+                                                  const float *A,
+                                                  int N, int K) {
+    int row = (int)blockIdx.x;
+    if (row >= N) return;
+    int tid = (int)threadIdx.x;
+
+    extern __shared__ float sh[];
+
+    /* Vectorized activation load: 128-bit float4 */
+    {
+        int n4 = K >> 2;
+        const float4 *A4 = (const float4 *)A;
+        float4 *sh4 = (float4 *)sh;
+        for (int i = tid; i < n4; i += (int)blockDim.x)
+            sh4[i] = A4[i];
+    }
+    __syncthreads();
+
+    /* Vectorized dot product: 128-bit uint4 weight loads (8 FP16 per load) */
+    const uint4 *w_vec = (const uint4 *)(W + (size_t)row * K);
+    const float4 *sh4 = (const float4 *)sh;
+    int n8 = K >> 3;
+    float sum = 0.0f;
+
+    for (int vi = tid; vi < n8; vi += (int)blockDim.x) {
+        uint4 w8 = w_vec[vi];
+        float4 a_lo = sh4[vi * 2];
+        float4 a_hi = sh4[vi * 2 + 1];
+
+        sum += fp16_w((unsigned short)(w8.x & 0xFFFFu)) * a_lo.x;
+        sum += fp16_w((unsigned short)(w8.x >> 16))      * a_lo.y;
+        sum += fp16_w((unsigned short)(w8.y & 0xFFFFu)) * a_lo.z;
+        sum += fp16_w((unsigned short)(w8.y >> 16))      * a_lo.w;
+        sum += fp16_w((unsigned short)(w8.z & 0xFFFFu)) * a_hi.x;
+        sum += fp16_w((unsigned short)(w8.z >> 16))      * a_hi.y;
+        sum += fp16_w((unsigned short)(w8.w & 0xFFFFu)) * a_hi.z;
+        sum += fp16_w((unsigned short)(w8.w >> 16))      * a_hi.w;
+    }
+    __syncthreads();
+
+    /* Block reduction (reuse shared memory) */
+    sh[tid] = sum;
+    __syncthreads();
+    for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sh[tid] += sh[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) out[row] = sh[0];
 }
 
 /* ========================================================================

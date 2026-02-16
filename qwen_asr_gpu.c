@@ -65,6 +65,11 @@ struct qwen_gpu_ctx {
     /* FP16 upload mode: when set, upload_weight_bf16 stores as FP16 */
     int fp16_mode;
 
+    /* FP16->F32 on-device dequantization scratch buffer.
+     * Pre-allocated to max per-layer weight size; lm_head tiles through it. */
+    float *d_W_dequant;
+    size_t d_W_dequant_cap;  /* capacity in floats */
+
     /* Host buffer for argmax download */
     float *h_argmax_buf;
     size_t h_argmax_cap;
@@ -219,6 +224,7 @@ void qwen_gpu_free(qwen_gpu_ctx_t *gpu) {
     if (gpu->d_A) cudaFree(gpu->d_A);
     if (gpu->d_C) cudaFree(gpu->d_C);
     if (gpu->d_A_f16) cudaFree(gpu->d_A_f16);
+    if (gpu->d_W_dequant) cudaFree(gpu->d_W_dequant);
     free(gpu->h_f16_buf);
     free(gpu->h_f32_buf);
     free(gpu->h_argmax_buf);
@@ -621,7 +627,7 @@ void qwen_gpu_get_stats(qwen_gpu_ctx_t *gpu, qwen_gpu_stats_t *stats) {
 extern int qwen_verbose;
 
 /* Number of CUDA kernel functions we load from the CUBIN */
-#define NUM_KERNELS 12
+#define NUM_KERNELS 14
 
 /* Kernel function indices */
 enum {
@@ -635,6 +641,8 @@ enum {
     KF_ATTN_GQA2,
     KF_ATTN_PROBE,
     KF_ARGMAX,
+    KF_F16_TO_F32,
+    KF_FP16_MATVEC,
     /* Encoder kernels */
     KF_LAYER_NORM,
     KF_GELU,
@@ -651,6 +659,8 @@ static const char *kernel_names[NUM_KERNELS] = {
     "qwen_attn_gqa2_f32",
     "qwen_attn_probe_f32",
     "qwen_argmax_f32",
+    "qwen_f16_to_f32",
+    "qwen_fp16_matvec_f32",
     "qwen_layer_norm_f32",
     "qwen_gelu_f32",
     "qwen_bias_add_f32",
@@ -785,58 +795,69 @@ static void gpu_gemm_d2d(cublasHandle_t handle, float *C_d, const float *A_d,
                 &beta, C_d, N);
 }
 
+/* Launch FP16→F32 dequantization kernel on device */
+static void gpu_dequant_f16_to_f32(qwen_gpu_dec_ctx_t *dctx,
+                                    float *dst, const void *src, int n) {
+    int threads = 256;
+    unsigned int blocks = ((unsigned int)n + 255) / 256;
+    void *args[] = { &dst, &src, &n };
+    launch_kernel(dctx->kernels[KF_F16_TO_F32],
+                  blocks, 1, 1, (unsigned int)threads, 1, 1, 0, args);
+}
+
 /* Device-to-device GEMM by weight handle: C_d[M,N] = A_d[M,K] @ W[N,K]^T
- * Dispatches to cublasSgemm for F32 weights or cublasGemmEx for FP16 weights.
- * For FP16: downloads F32 activation to CPU, converts to FP16, re-uploads,
- * then GEMMs with FP16×FP16→F32. For M=1 decoder path the activation is
- * only K floats (~4-12KB) so the round-trip overhead is negligible. */
-static void gpu_gemm_d2d_handle(qwen_gpu_ctx_t *gpu, cublasHandle_t handle,
+ * For FP16 weights with M=1 (decode): fused FP16 matvec kernel reads FP16
+ * weights directly, converts to F32 in registers, multiplies by activation
+ * cached in shared memory. Bandwidth = 2 bytes/element (half of F32).
+ * For FP16 with M>1: dequant scratch + cublasSgemm fallback.
+ * For F32: standard cublasSgemm. */
+static void gpu_gemm_d2d_handle(qwen_gpu_ctx_t *gpu, qwen_gpu_dec_ctx_t *dctx,
+                                 cublasHandle_t handle,
                                  float *C_d, const float *A_d,
                                  int weight_handle, int M, int K, int N) {
     gpu_weight_entry_t *w = &gpu->weights[weight_handle];
     float alpha = 1.0f, beta = 0.0f;
 
     if (w->dtype == GPU_DTYPE_F16) {
-        size_t A_size = (size_t)M * K;
+        if (M == 1) {
+            /* Fused FP16 matvec: one block per output element, reads FP16
+             * weights and converts to F32 in registers. No scratch buffer. */
+            unsigned int shmem = (unsigned int)K * sizeof(float);
+            void *args[] = { &C_d, &w->d_ptr, &A_d, &N, &K };
+            launch_kernel(dctx->kernels[KF_FP16_MATVEC],
+                          (unsigned int)N, 1, 1, 256, 1, 1, shmem, args);
+        } else {
+            /* M>1 fallback: dequant + cublasSgemm */
+            size_t W_size = (size_t)K * N;
+            size_t scratch_cap = gpu->d_W_dequant_cap;
 
-        /* Ensure FP16 device buffer */
-        if (ensure_device_buf_f16(&gpu->d_A_f16, &gpu->d_A_f16_cap, A_size,
-                                   &gpu->vram_buffers) != 0) return;
-
-        /* Ensure host staging buffers */
-        if (gpu->h_f32_buf_cap < A_size) {
-            free(gpu->h_f32_buf);
-            gpu->h_f32_buf = (float *)malloc(A_size * sizeof(float));
-            gpu->h_f32_buf_cap = gpu->h_f32_buf ? A_size : 0;
+            if (W_size <= scratch_cap) {
+                gpu_dequant_f16_to_f32(dctx, gpu->d_W_dequant, w->d_ptr, (int)W_size);
+                cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                            N, M, K, &alpha,
+                            gpu->d_W_dequant, K,
+                            A_d, K,
+                            &beta, C_d, N);
+            } else {
+                int tile_N = (int)(scratch_cap / (size_t)K);
+                if (tile_N <= 0) {
+                    fprintf(stderr, "GPU dec: dequant scratch too small for K=%d (cap=%zu)\n",
+                            K, scratch_cap);
+                    return;
+                }
+                for (int start = 0; start < N; start += tile_N) {
+                    int cur_N = (start + tile_N <= N) ? tile_N : (N - start);
+                    int tile_elems = cur_N * K;
+                    uint16_t *w_tile = (uint16_t *)w->d_ptr + (size_t)start * K;
+                    gpu_dequant_f16_to_f32(dctx, gpu->d_W_dequant, w_tile, tile_elems);
+                    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                                cur_N, M, K, &alpha,
+                                gpu->d_W_dequant, K,
+                                A_d, K,
+                                &beta, C_d + start, N);
+                }
+            }
         }
-        if (!gpu->h_f32_buf) return;
-
-        if (gpu->h_f16_buf_cap < A_size) {
-            free(gpu->h_f16_buf);
-            gpu->h_f16_buf = (uint16_t *)malloc(A_size * sizeof(uint16_t));
-            gpu->h_f16_buf_cap = gpu->h_f16_buf ? A_size : 0;
-        }
-        if (!gpu->h_f16_buf) return;
-
-        /* Download F32 activation from device, convert to FP16, re-upload */
-        cudaMemcpy(gpu->h_f32_buf, A_d, A_size * sizeof(float),
-                   cudaMemcpyDeviceToHost);
-        for (size_t i = 0; i < A_size; i++)
-            gpu->h_f16_buf[i] = f32_to_f16_bits(gpu->h_f32_buf[i]);
-        cudaMemcpy(gpu->d_A_f16, gpu->h_f16_buf, A_size * sizeof(uint16_t),
-                   cudaMemcpyHostToDevice);
-
-        /* cublasGemmEx: FP16×FP16 → F32 output, F32 accumulation */
-        cublasGemmEx(handle,
-                     CUBLAS_OP_T, CUBLAS_OP_N,
-                     N, M, K,
-                     &alpha,
-                     w->d_ptr, CUDA_R_16F, K,
-                     gpu->d_A_f16, CUDA_R_16F, K,
-                     &beta,
-                     C_d, CUDA_R_32F, N,
-                     CUBLAS_COMPUTE_32F,
-                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     } else {
         /* F32 path (same as gpu_gemm_d2d) */
         cublasSgemm(handle,
@@ -930,6 +951,28 @@ qwen_gpu_dec_ctx_t *qwen_gpu_dec_init(qwen_gpu_ctx_t *gpu,
         fprintf(stderr, "GPU dec: activation buffers %.1f KB, logits %.1f MB\n",
                 dctx->vram_activations / 1024.0,
                 (size_t)cfg->vocab_size * sizeof(float) / (1024.0 * 1024.0));
+
+    /* Pre-allocate FP16->F32 dequantization scratch buffer on parent GPU context.
+     * Sized to the max per-layer weight (gate_up_fused: 2 * intermediate * hidden).
+     * The lm_head (vocab * hidden) is larger and tiles through this buffer.
+     * Note: gpu->fp16_mode is transient (reset after weight upload), so check
+     * the global FP16 flag or weight count instead. */
+    if (gpu->n_weights_f16 > 0 && gpu->d_W_dequant_cap == 0) {
+        size_t max_layer_floats = (size_t)2 * inter * hidden;
+        size_t dq_bytes = max_layer_floats * sizeof(float);
+        cudaError_t dq_err = cudaMalloc((void **)&gpu->d_W_dequant, dq_bytes);
+        if (dq_err != cudaSuccess) {
+            fprintf(stderr, "GPU dec: failed to allocate dequant scratch (%.1f MB): %s\n",
+                    dq_bytes / (1024.0 * 1024.0), cudaGetErrorString(dq_err));
+            goto fail;
+        }
+        gpu->d_W_dequant_cap = max_layer_floats;
+        gpu->vram_buffers += dq_bytes;
+        if (qwen_verbose >= 1)
+            fprintf(stderr, "GPU dec: FP16 dequant scratch %.1f MB (tiles lm_head in %d chunks)\n",
+                    dq_bytes / (1024.0 * 1024.0),
+                    (int)((size_t)cfg->vocab_size * hidden / max_layer_floats + 1));
+    }
 
     /* Initial KV cache: 1024 positions */
     if (qwen_gpu_kv_cache_grow(dctx, cfg, 1024) != 0)
@@ -1254,9 +1297,9 @@ int qwen_gpu_decoder_forward(qwen_gpu_dec_ctx_t *dctx,
             int wv_h = qwen_gpu_find_weight(gpu, l->wv_weight_bf16);
 
             /* Q[1, q_dim] = x_norm[1, hidden] @ Wq[q_dim, hidden]^T */
-            gpu_gemm_d2d_handle(gpu, cblas, dctx->d_q, dctx->d_x_norm, wq_h, 1, hidden, q_dim);
-            gpu_gemm_d2d_handle(gpu, cblas, dctx->d_k, dctx->d_x_norm, wk_h, 1, hidden, kv_dim);
-            gpu_gemm_d2d_handle(gpu, cblas, dctx->d_v, dctx->d_x_norm, wv_h, 1, hidden, kv_dim);
+            gpu_gemm_d2d_handle(gpu, dctx, cblas, dctx->d_q, dctx->d_x_norm, wq_h, 1, hidden, q_dim);
+            gpu_gemm_d2d_handle(gpu, dctx, cblas, dctx->d_k, dctx->d_x_norm, wk_h, 1, hidden, kv_dim);
+            gpu_gemm_d2d_handle(gpu, dctx, cblas, dctx->d_v, dctx->d_x_norm, wv_h, 1, hidden, kv_dim);
         }
 
         /* --- Per-head Q/K RMSNorm --- */
@@ -1342,7 +1385,7 @@ int qwen_gpu_decoder_forward(qwen_gpu_dec_ctx_t *dctx,
         /* --- Output projection + residual --- */
         {
             int wo_h = qwen_gpu_find_weight(gpu, l->wo_weight_bf16);
-            gpu_gemm_d2d_handle(gpu, cblas, dctx->d_proj_out, dctx->d_attn_out, wo_h, 1, q_dim, hidden);
+            gpu_gemm_d2d_handle(gpu, dctx, cblas, dctx->d_proj_out, dctx->d_attn_out, wo_h, 1, q_dim, hidden);
 
             unsigned int grid = ((unsigned)hidden + 255) / 256;
             void *args[] = { &dctx->d_x, &dctx->d_proj_out, &hidden };
@@ -1366,7 +1409,7 @@ int qwen_gpu_decoder_forward(qwen_gpu_dec_ctx_t *dctx,
         {
             /* Fused gate+up GEMM: gate_buf[1, 2*inter] = x_norm[1, hidden] @ W[2*inter, hidden]^T */
             int wgu_h = qwen_gpu_find_weight(gpu, l->gate_up_fused_bf16);
-            gpu_gemm_d2d_handle(gpu, cblas, dctx->d_gate_buf, dctx->d_x_norm, wgu_h, 1, hidden, 2 * intermediate);
+            gpu_gemm_d2d_handle(gpu, dctx, cblas, dctx->d_gate_buf, dctx->d_x_norm, wgu_h, 1, hidden, 2 * intermediate);
 
             /* SwiGLU: ffn_out[inter] = SiLU(gate_buf[even]) * gate_buf[odd] */
             unsigned int grid = ((unsigned)intermediate + 255) / 256;
@@ -1378,7 +1421,7 @@ int qwen_gpu_decoder_forward(qwen_gpu_dec_ctx_t *dctx,
 
             /* Down projection: proj_out[1, hidden] = ffn_out[1, inter] @ Wdown[hidden, inter]^T */
             int wd_h = qwen_gpu_find_weight(gpu, l->down_weight_bf16);
-            gpu_gemm_d2d_handle(gpu, cblas, dctx->d_proj_out, dctx->d_ffn_out, wd_h, 1, intermediate, hidden);
+            gpu_gemm_d2d_handle(gpu, dctx, cblas, dctx->d_proj_out, dctx->d_ffn_out, wd_h, 1, intermediate, hidden);
 
             /* Residual add */
             void *add_args[] = { &dctx->d_x, &dctx->d_proj_out, &hidden };
@@ -1406,7 +1449,7 @@ int qwen_gpu_decoder_forward(qwen_gpu_dec_ctx_t *dctx,
     {
         int we_h = qwen_gpu_find_weight(gpu, dec->tok_embeddings_bf16);
         /* logits[1, vocab] = x_norm[1, hidden] @ W_embed[vocab, hidden]^T */
-        gpu_gemm_d2d_handle(gpu, cblas, dctx->d_logits, dctx->d_x_norm, we_h, 1, hidden, cfg->vocab_size);
+        gpu_gemm_d2d_handle(gpu, dctx, cblas, dctx->d_logits, dctx->d_x_norm, we_h, 1, hidden, cfg->vocab_size);
     }
 
     /* --- Argmax on device --- */
