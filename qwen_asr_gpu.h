@@ -55,6 +55,14 @@ int qwen_gpu_argmax_matvec(qwen_gpu_ctx_t *gpu,
                             const float *x_host, int weight_handle,
                             int in_dim, int out_dim);
 
+/* Set FP16 upload mode. When enabled, qwen_gpu_upload_weight_bf16() converts
+ * BF16->FP16 (2 bytes/element) instead of BF16->F32 (4 bytes/element).
+ * GEMM automatically dispatches to cublasGemmEx for FP16 weights. */
+void qwen_gpu_set_fp16_mode(qwen_gpu_ctx_t *gpu, int enable);
+
+/* Query whether a weight (by handle) is stored as FP16. Returns 1 if FP16, 0 if F32. */
+int qwen_gpu_weight_is_fp16(qwen_gpu_ctx_t *gpu, int handle);
+
 /* Print GPU memory usage stats to stderr. */
 void qwen_gpu_print_stats(qwen_gpu_ctx_t *gpu);
 

@@ -24,11 +24,14 @@ extern int qwen_verbose;
 
 #define MAX_GPU_WEIGHTS 512
 
+typedef enum { GPU_DTYPE_F32 = 0, GPU_DTYPE_F16 = 1 } gpu_dtype_t;
+
 typedef struct {
     const void *host_ptr;   /* CPU pointer (lookup key) */
-    float *d_ptr;           /* GPU device pointer (f32) */
+    void *d_ptr;            /* GPU device pointer (f32 or f16) */
     int rows;
     int cols;
+    gpu_dtype_t dtype;      /* F32 or F16 */
 } gpu_weight_entry_t;
 
 struct qwen_gpu_ctx {
@@ -44,6 +47,19 @@ struct qwen_gpu_ctx {
     size_t d_A_cap;     /* capacity in floats */
     size_t d_C_cap;
 
+    /* FP16 activation buffer (device) for mixed-precision GEMM.
+     * When weight is FP16, activations are converted F32->FP16 on CPU,
+     * uploaded to d_A_f16, and cublasGemmEx does FP16*FP16->F32. */
+    void *d_A_f16;
+    size_t d_A_f16_cap; /* capacity in fp16 elements (uint16_t) */
+
+    /* Host staging buffer for F32->FP16 conversion */
+    uint16_t *h_f16_buf;
+    size_t h_f16_buf_cap; /* capacity in uint16_t elements */
+
+    /* FP16 upload mode: when set, upload_weight_bf16 stores as FP16 */
+    int fp16_mode;
+
     /* Host buffer for argmax download */
     float *h_argmax_buf;
     size_t h_argmax_cap;
@@ -51,7 +67,36 @@ struct qwen_gpu_ctx {
     /* VRAM tracking */
     size_t vram_weights;
     size_t vram_buffers;
+    int n_weights_f32;
+    int n_weights_f16;
 };
+
+/* Convert F32 to FP16 (IEEE 754 half-precision) with clamping.
+ * Manual bit manipulation — no cuda_fp16.h dependency. */
+static uint16_t f32_to_f16_bits(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    uint32_t sign = (u >> 16) & 0x8000;
+    int exp = (int)((u >> 23) & 0xFF) - 127;
+    uint32_t mant = u & 0x7FFFFF;
+
+    if (exp > 15) {
+        /* Overflow: clamp to FP16 max (65504) */
+        return (uint16_t)(sign | 0x7BFF);
+    } else if (exp < -14) {
+        /* Subnormal or zero */
+        if (exp < -24) return (uint16_t)sign; /* too small -> zero */
+        mant |= 0x800000; /* add implicit 1 */
+        int shift = -1 - exp;
+        uint16_t half_mant = (uint16_t)(mant >> shift);
+        return (uint16_t)(sign | half_mant);
+    } else {
+        /* Normal */
+        uint16_t half_exp = (uint16_t)((exp + 15) << 10);
+        uint16_t half_mant = (uint16_t)(mant >> 13);
+        return (uint16_t)(sign | half_exp | half_mant);
+    }
+}
 
 /* Ensure a device buffer has at least 'need' floats. Grows by doubling. */
 static int ensure_device_buf(float **d_buf, size_t *cap, size_t need,
@@ -76,6 +121,32 @@ static int ensure_device_buf(float **d_buf, size_t *cap, size_t need,
     *d_buf = new_buf;
     *cap = new_cap;
     if (vram_counter) *vram_counter += new_cap * sizeof(float);
+    return 0;
+}
+
+/* Ensure a device buffer has at least 'need' uint16_t elements. */
+static int ensure_device_buf_f16(void **d_buf, size_t *cap, size_t need,
+                                  size_t *vram_counter) {
+    if (need <= *cap) return 0;
+    size_t new_cap = *cap > 0 ? *cap : 4096;
+    while (new_cap < need) new_cap *= 2;
+
+    void *new_buf;
+    cudaError_t err = cudaMalloc(&new_buf, new_cap * sizeof(uint16_t));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU: cudaMalloc failed for f16 buffer (%.1f MB): %s\n",
+                new_cap * sizeof(uint16_t) / (1024.0 * 1024.0),
+                cudaGetErrorString(err));
+        return -1;
+    }
+
+    if (*d_buf) {
+        if (vram_counter) *vram_counter -= *cap * sizeof(uint16_t);
+        cudaFree(*d_buf);
+    }
+    *d_buf = new_buf;
+    *cap = new_cap;
+    if (vram_counter) *vram_counter += new_cap * sizeof(uint16_t);
     return 0;
 }
 
@@ -121,6 +192,8 @@ void qwen_gpu_free(qwen_gpu_ctx_t *gpu) {
 
     if (gpu->d_A) cudaFree(gpu->d_A);
     if (gpu->d_C) cudaFree(gpu->d_C);
+    if (gpu->d_A_f16) cudaFree(gpu->d_A_f16);
+    free(gpu->h_f16_buf);
     free(gpu->h_argmax_buf);
 
     cublasDestroy(gpu->handle);
@@ -157,7 +230,9 @@ int qwen_gpu_upload_weight_f32(qwen_gpu_ctx_t *gpu, const float *host_ptr,
     w->d_ptr = d_ptr;
     w->rows = rows;
     w->cols = cols;
+    w->dtype = GPU_DTYPE_F32;
     gpu->vram_weights += bytes;
+    gpu->n_weights_f32++;
     return 0;
 }
 
@@ -170,9 +245,63 @@ int qwen_gpu_upload_weight_bf16(qwen_gpu_ctx_t *gpu, const uint16_t *host_ptr,
     }
 
     size_t n = (size_t)rows * cols;
+
+    if (gpu->fp16_mode) {
+        /* BF16 -> FP16: 2 bytes per element, half the VRAM of F32 */
+        size_t bytes = n * sizeof(uint16_t);
+        uint16_t *h_f16 = (uint16_t *)malloc(bytes);
+        if (!h_f16) return -1;
+
+        int n_clamped = 0;
+        for (size_t i = 0; i < n; i++) {
+            /* BF16 -> F32 -> FP16 */
+            uint32_t u32 = ((uint32_t)host_ptr[i]) << 16;
+            float f;
+            memcpy(&f, &u32, sizeof(float));
+            h_f16[i] = f32_to_f16_bits(f);
+            /* Check for clamping (BF16 value exceeded FP16 range) */
+            if ((u32 & 0x7F800000) != 0 && (u32 & 0x7F800000) != 0x7F800000) {
+                float absf = f < 0 ? -f : f;
+                if (absf > 65504.0f) n_clamped++;
+            }
+        }
+
+        if (n_clamped > 0) {
+            fprintf(stderr, "GPU: WARNING: %d/%zu BF16 values clamped to FP16 range\n",
+                    n_clamped, n);
+        }
+
+        void *d_ptr;
+        cudaError_t err = cudaMalloc(&d_ptr, bytes);
+        if (err != cudaSuccess) {
+            free(h_f16);
+            fprintf(stderr, "GPU: cudaMalloc failed for fp16 weight %dx%d (%.1f MB): %s\n",
+                    rows, cols, bytes / (1024.0 * 1024.0), cudaGetErrorString(err));
+            return -1;
+        }
+
+        err = cudaMemcpy(d_ptr, h_f16, bytes, cudaMemcpyHostToDevice);
+        free(h_f16);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "GPU: cudaMemcpy H2D failed: %s\n", cudaGetErrorString(err));
+            cudaFree(d_ptr);
+            return -1;
+        }
+
+        gpu_weight_entry_t *w = &gpu->weights[gpu->n_weights++];
+        w->host_ptr = host_ptr;
+        w->d_ptr = d_ptr;
+        w->rows = rows;
+        w->cols = cols;
+        w->dtype = GPU_DTYPE_F16;
+        gpu->vram_weights += bytes;
+        gpu->n_weights_f16++;
+        return 0;
+    }
+
+    /* Default path: BF16 -> F32 */
     size_t bytes = n * sizeof(float);
 
-    /* Convert bf16 -> f32 on CPU */
     float *h_f32 = (float *)malloc(bytes);
     if (!h_f32) return -1;
 
@@ -181,9 +310,8 @@ int qwen_gpu_upload_weight_bf16(qwen_gpu_ctx_t *gpu, const uint16_t *host_ptr,
         h_u32[i] = ((uint32_t)host_ptr[i]) << 16;
     }
 
-    /* Upload f32 to GPU */
-    float *d_ptr;
-    cudaError_t err = cudaMalloc((void **)&d_ptr, bytes);
+    void *d_ptr;
+    cudaError_t err = cudaMalloc(&d_ptr, bytes);
     if (err != cudaSuccess) {
         free(h_f32);
         fprintf(stderr, "GPU: cudaMalloc failed for bf16 weight %dx%d (%.1f MB): %s\n",
@@ -204,7 +332,9 @@ int qwen_gpu_upload_weight_bf16(qwen_gpu_ctx_t *gpu, const uint16_t *host_ptr,
     w->d_ptr = d_ptr;
     w->rows = rows;
     w->cols = cols;
+    w->dtype = GPU_DTYPE_F32;
     gpu->vram_weights += bytes;
+    gpu->n_weights_f32++;
     return 0;
 }
 
@@ -225,29 +355,59 @@ void qwen_gpu_gemm(qwen_gpu_ctx_t *gpu, float *C_host,
     size_t A_size = (size_t)M * K;
     size_t C_size = (size_t)M * N;
 
-    /* Ensure activation buffers are large enough */
-    if (ensure_device_buf(&gpu->d_A, &gpu->d_A_cap, A_size, &gpu->vram_buffers) != 0) return;
     if (ensure_device_buf(&gpu->d_C, &gpu->d_C_cap, C_size, &gpu->vram_buffers) != 0) return;
 
-    /* Upload activation A[M,K] to GPU */
-    cudaMemcpy(gpu->d_A, A_host, A_size * sizeof(float), cudaMemcpyHostToDevice);
+    if (w->dtype == GPU_DTYPE_F16) {
+        /* FP16 path: convert activation F32->FP16 on CPU, upload, cublasGemmEx */
+        if (ensure_device_buf_f16(&gpu->d_A_f16, &gpu->d_A_f16_cap, A_size,
+                                   &gpu->vram_buffers) != 0) return;
 
-    /* cuBLAS GEMM: row-major C[M,N] = A[M,K] @ W[N,K]^T
-     *
-     * cuBLAS is column-major. The standard trick:
-     *   cblas_sgemm(RowMajor, NoTrans, Trans, M, N, K, 1, A, K, W, K, 0, C, N)
-     * becomes:
-     *   cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &a, W, K, A, K, &b, C, N)
-     */
-    float alpha = 1.0f, beta = 0.0f;
-    cublasSgemm(gpu->handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                N, M, K,
-                &alpha, w->d_ptr, K,
-                gpu->d_A, K,
-                &beta, gpu->d_C, N);
+        /* Ensure host staging buffer */
+        if (gpu->h_f16_buf_cap < A_size) {
+            free(gpu->h_f16_buf);
+            gpu->h_f16_buf = (uint16_t *)malloc(A_size * sizeof(uint16_t));
+            gpu->h_f16_buf_cap = gpu->h_f16_buf ? A_size : 0;
+        }
+        if (!gpu->h_f16_buf) return;
 
-    /* Download result C[M,N] from GPU */
+        /* F32 -> FP16 conversion */
+        for (size_t i = 0; i < A_size; i++) {
+            gpu->h_f16_buf[i] = f32_to_f16_bits(A_host[i]);
+        }
+
+        /* Upload FP16 activation */
+        cudaMemcpy(gpu->d_A_f16, gpu->h_f16_buf, A_size * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice);
+
+        /* cublasGemmEx: FP16 inputs, F32 accumulation, F32 output
+         * Same column-major trick as cublasSgemm. */
+        float alpha = 1.0f, beta = 0.0f;
+        cublasGemmEx(gpu->handle,
+                     CUBLAS_OP_T, CUBLAS_OP_N,
+                     N, M, K,
+                     &alpha,
+                     w->d_ptr, CUDA_R_16F, K,
+                     gpu->d_A_f16, CUDA_R_16F, K,
+                     &beta,
+                     gpu->d_C, CUDA_R_32F, N,
+                     CUBLAS_COMPUTE_32F,
+                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    } else {
+        /* F32 path (original) */
+        if (ensure_device_buf(&gpu->d_A, &gpu->d_A_cap, A_size, &gpu->vram_buffers) != 0) return;
+
+        cudaMemcpy(gpu->d_A, A_host, A_size * sizeof(float), cudaMemcpyHostToDevice);
+
+        float alpha = 1.0f, beta = 0.0f;
+        cublasSgemm(gpu->handle,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    N, M, K,
+                    &alpha, (const float *)w->d_ptr, K,
+                    gpu->d_A, K,
+                    &beta, gpu->d_C, N);
+    }
+
+    /* Download result C[M,N] from GPU (always F32) */
     cudaMemcpy(C_host, gpu->d_C, C_size * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
@@ -260,19 +420,53 @@ int qwen_gpu_argmax_matvec(qwen_gpu_ctx_t *gpu,
     size_t A_size = (size_t)in_dim;
     size_t C_size = (size_t)out_dim;
 
-    if (ensure_device_buf(&gpu->d_A, &gpu->d_A_cap, A_size, &gpu->vram_buffers) != 0) return 0;
     if (ensure_device_buf(&gpu->d_C, &gpu->d_C_cap, C_size, &gpu->vram_buffers) != 0) return 0;
 
-    cudaMemcpy(gpu->d_A, x_host, A_size * sizeof(float), cudaMemcpyHostToDevice);
-
-    float alpha = 1.0f, beta = 0.0f;
     gpu_weight_entry_t *w = &gpu->weights[weight_handle];
-    cublasSgemm(gpu->handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                out_dim, 1, in_dim,
-                &alpha, w->d_ptr, in_dim,
-                gpu->d_A, in_dim,
-                &beta, gpu->d_C, out_dim);
+    float alpha = 1.0f, beta = 0.0f;
+
+    if (w->dtype == GPU_DTYPE_F16) {
+        /* FP16 path */
+        if (ensure_device_buf_f16(&gpu->d_A_f16, &gpu->d_A_f16_cap, A_size,
+                                   &gpu->vram_buffers) != 0) return 0;
+
+        if (gpu->h_f16_buf_cap < A_size) {
+            free(gpu->h_f16_buf);
+            gpu->h_f16_buf = (uint16_t *)malloc(A_size * sizeof(uint16_t));
+            gpu->h_f16_buf_cap = gpu->h_f16_buf ? A_size : 0;
+        }
+        if (!gpu->h_f16_buf) return 0;
+
+        for (size_t i = 0; i < A_size; i++) {
+            gpu->h_f16_buf[i] = f32_to_f16_bits(x_host[i]);
+        }
+
+        cudaMemcpy(gpu->d_A_f16, gpu->h_f16_buf, A_size * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice);
+
+        cublasGemmEx(gpu->handle,
+                     CUBLAS_OP_T, CUBLAS_OP_N,
+                     out_dim, 1, in_dim,
+                     &alpha,
+                     w->d_ptr, CUDA_R_16F, in_dim,
+                     gpu->d_A_f16, CUDA_R_16F, in_dim,
+                     &beta,
+                     gpu->d_C, CUDA_R_32F, out_dim,
+                     CUBLAS_COMPUTE_32F,
+                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    } else {
+        /* F32 path */
+        if (ensure_device_buf(&gpu->d_A, &gpu->d_A_cap, A_size, &gpu->vram_buffers) != 0) return 0;
+
+        cudaMemcpy(gpu->d_A, x_host, A_size * sizeof(float), cudaMemcpyHostToDevice);
+
+        cublasSgemm(gpu->handle,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    out_dim, 1, in_dim,
+                    &alpha, (const float *)w->d_ptr, in_dim,
+                    gpu->d_A, in_dim,
+                    &beta, gpu->d_C, out_dim);
+    }
 
     /* Download logits and find argmax on CPU */
     if (gpu->h_argmax_cap < (size_t)out_dim) {
@@ -298,7 +492,10 @@ int qwen_gpu_argmax_matvec(qwen_gpu_ctx_t *gpu,
 
 float *qwen_gpu_get_weight_ptr(qwen_gpu_ctx_t *gpu, int handle) {
     if (!gpu || handle < 0 || handle >= gpu->n_weights) return NULL;
-    return gpu->weights[handle].d_ptr;
+    /* Return NULL for FP16 weights — only F32 weights can be used as
+     * raw float* by the full GPU decoder (ASR CUDA kernels). */
+    if (gpu->weights[handle].dtype == GPU_DTYPE_F16) return NULL;
+    return (float *)gpu->weights[handle].d_ptr;
 }
 
 void *qwen_gpu_get_cublas_handle(qwen_gpu_ctx_t *gpu) {
@@ -306,10 +503,19 @@ void *qwen_gpu_get_cublas_handle(qwen_gpu_ctx_t *gpu) {
     return (void *)gpu->handle;
 }
 
+void qwen_gpu_set_fp16_mode(qwen_gpu_ctx_t *gpu, int enable) {
+    if (gpu) gpu->fp16_mode = enable;
+}
+
+int qwen_gpu_weight_is_fp16(qwen_gpu_ctx_t *gpu, int handle) {
+    if (!gpu || handle < 0 || handle >= gpu->n_weights) return 0;
+    return gpu->weights[handle].dtype == GPU_DTYPE_F16;
+}
+
 void qwen_gpu_print_stats(qwen_gpu_ctx_t *gpu) {
     if (!gpu) return;
-    fprintf(stderr, "GPU: %d weights uploaded (%.0f MB), buffers %.0f MB\n",
-            gpu->n_weights,
+    fprintf(stderr, "GPU: %d weights (%d F32, %d FP16, ~%.0f MB), buffers %.0f MB\n",
+            gpu->n_weights, gpu->n_weights_f32, gpu->n_weights_f16,
             gpu->vram_weights / (1024.0 * 1024.0),
             gpu->vram_buffers / (1024.0 * 1024.0));
 }
