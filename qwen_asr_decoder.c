@@ -390,7 +390,10 @@ static void ensure_dec_buffers(qwen_ctx_t *ctx) {
 
 int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
 #ifdef USE_CUDA_KERNELS
-    if (ctx->gpu_dec_ctx) {
+    /* Skip full GPU decoder when FP16 decoder weights are active.
+     * FP16 GEMMs + CUDA kernel numeric variance causes token divergence.
+     * Fall through to CPU decoder with GPU GEMM offload (correct + FP16 VRAM savings). */
+    if (ctx->gpu_dec_ctx && !qwen_get_gpu_fp16()) {
         extern qwen_gpu_ctx_t *g_gpu_ctx;
         qwen_gpu_dec_ctx_t *dctx = (qwen_gpu_dec_ctx_t *)ctx->gpu_dec_ctx;
         const qwen_config_t *cfg = &ctx->config;

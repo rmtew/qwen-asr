@@ -339,7 +339,15 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     if (g_gpu_ctx) {
         if (qwen_verbose >= 1) fprintf(stderr, "Uploading weights to GPU...\n");
         gpu_upload_encoder_weights(g_gpu_ctx, &ctx->encoder, &ctx->config);
+        /* Decoder weights: FP16 when --fp16 is set (halves VRAM) */
+        if (qwen_get_gpu_fp16()) {
+            qwen_gpu_set_fp16_mode(g_gpu_ctx, 1);
+            if (qwen_verbose >= 1)
+                fprintf(stderr, "GPU: FP16 mode — decoder weights as FP16\n");
+        }
         gpu_upload_decoder_weights(g_gpu_ctx, &ctx->decoder, &ctx->config);
+        if (qwen_get_gpu_fp16())
+            qwen_gpu_set_fp16_mode(g_gpu_ctx, 0);
         if (qwen_verbose >= 1) qwen_gpu_print_stats(g_gpu_ctx);
 
 #ifdef USE_CUDA_KERNELS

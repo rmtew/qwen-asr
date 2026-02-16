@@ -87,6 +87,12 @@ void qwen_gpu_get_stats(qwen_gpu_ctx_t *gpu, qwen_gpu_stats_t *stats);
 /* Get the cuBLAS handle (for use by GPU decoder context). */
 void *qwen_gpu_get_cublas_handle(qwen_gpu_ctx_t *gpu);
 
+/* Global FP16 flag for ASR decoder weights. Call before qwen_load() so
+ * decoder BF16 weights are uploaded as FP16 instead of F32.
+ * Encoder weights (F32 on disk) are unaffected. */
+void qwen_set_gpu_fp16(int enable);
+int  qwen_get_gpu_fp16(void);
+
 #endif /* USE_CUBLAS */
 
 /* ========================================================================
