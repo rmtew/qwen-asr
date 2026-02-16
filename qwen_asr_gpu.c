@@ -22,7 +22,7 @@
 
 extern int qwen_verbose;
 
-#define MAX_GPU_WEIGHTS 512
+#define GPU_WEIGHTS_INITIAL_CAP 256
 
 typedef enum { GPU_DTYPE_F32 = 0, GPU_DTYPE_F16 = 1 } gpu_dtype_t;
 
@@ -37,8 +37,9 @@ typedef struct {
 struct qwen_gpu_ctx {
     cublasHandle_t handle;
 
-    gpu_weight_entry_t weights[MAX_GPU_WEIGHTS];
+    gpu_weight_entry_t *weights;  /* dynamically grown */
     int n_weights;
+    int weights_cap;
 
     /* Pre-allocated device buffers for activations and results.
      * Grown dynamically as needed. */
@@ -150,6 +151,21 @@ static int ensure_device_buf_f16(void **d_buf, size_t *cap, size_t need,
     return 0;
 }
 
+/* Ensure weight registry has room for at least one more entry. */
+static int gpu_weights_grow(qwen_gpu_ctx_t *gpu) {
+    if (gpu->n_weights < gpu->weights_cap) return 0;
+    int new_cap = gpu->weights_cap > 0 ? gpu->weights_cap * 2 : GPU_WEIGHTS_INITIAL_CAP;
+    gpu_weight_entry_t *new_arr = (gpu_weight_entry_t *)realloc(
+        gpu->weights, (size_t)new_cap * sizeof(gpu_weight_entry_t));
+    if (!new_arr) {
+        fprintf(stderr, "GPU: failed to grow weight registry to %d\n", new_cap);
+        return -1;
+    }
+    gpu->weights = new_arr;
+    gpu->weights_cap = new_cap;
+    return 0;
+}
+
 qwen_gpu_ctx_t *qwen_gpu_init(void) {
     int device_count = 0;
     cudaError_t err = cudaGetDeviceCount(&device_count);
@@ -180,6 +196,11 @@ qwen_gpu_ctx_t *qwen_gpu_init(void) {
      * the fastest algorithm. */
     cublasSetMathMode(gpu->handle, CUBLAS_DEFAULT_MATH);
 
+    /* Allocate initial weight registry */
+    gpu->weights = (gpu_weight_entry_t *)calloc(GPU_WEIGHTS_INITIAL_CAP,
+                                                 sizeof(gpu_weight_entry_t));
+    gpu->weights_cap = gpu->weights ? GPU_WEIGHTS_INITIAL_CAP : 0;
+
     return gpu;
 }
 
@@ -189,6 +210,7 @@ void qwen_gpu_free(qwen_gpu_ctx_t *gpu) {
     for (int i = 0; i < gpu->n_weights; i++) {
         if (gpu->weights[i].d_ptr) cudaFree(gpu->weights[i].d_ptr);
     }
+    free(gpu->weights);
 
     if (gpu->d_A) cudaFree(gpu->d_A);
     if (gpu->d_C) cudaFree(gpu->d_C);
@@ -203,10 +225,7 @@ void qwen_gpu_free(qwen_gpu_ctx_t *gpu) {
 int qwen_gpu_upload_weight_f32(qwen_gpu_ctx_t *gpu, const float *host_ptr,
                                 int rows, int cols) {
     if (!gpu || !host_ptr) return -1;
-    if (gpu->n_weights >= MAX_GPU_WEIGHTS) {
-        fprintf(stderr, "GPU: weight registry full (%d)\n", MAX_GPU_WEIGHTS);
-        return -1;
-    }
+    if (gpu_weights_grow(gpu) != 0) return -1;
 
     size_t n = (size_t)rows * cols;
     size_t bytes = n * sizeof(float);
@@ -239,10 +258,7 @@ int qwen_gpu_upload_weight_f32(qwen_gpu_ctx_t *gpu, const float *host_ptr,
 int qwen_gpu_upload_weight_bf16(qwen_gpu_ctx_t *gpu, const uint16_t *host_ptr,
                                  int rows, int cols) {
     if (!gpu || !host_ptr) return -1;
-    if (gpu->n_weights >= MAX_GPU_WEIGHTS) {
-        fprintf(stderr, "GPU: weight registry full (%d)\n", MAX_GPU_WEIGHTS);
-        return -1;
-    }
+    if (gpu_weights_grow(gpu) != 0) return -1;
 
     size_t n = (size_t)rows * cols;
 
