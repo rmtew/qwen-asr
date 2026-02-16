@@ -1197,14 +1197,16 @@ static inline void qwen_vec_scale_add(float *dst, const float *src, float correc
     qwen_vec_scale_add_impl(dst, src, correction, n);
 }
 
-void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
-                                   const float *V, int seq,
-                                   int n_heads, int head_dim, float scale,
-                                   const int *window_starts, int n_windows) {
-    (void)seq;
+static void qwen_bidirectional_attention_heads(float *out, const float *Q,
+                                                const float *K, const float *V,
+                                                int n_heads, int head_dim,
+                                                float scale,
+                                                const int *window_starts,
+                                                int n_windows,
+                                                int head_start, int head_end) {
     int hidden = n_heads * head_dim;
 
-    for (int h = 0; h < n_heads; h++) {
+    for (int h = head_start; h < head_end; h++) {
         for (int w = 0; w < n_windows; w++) {
             int ws = window_starts[w];
             int we = window_starts[w + 1];
@@ -1243,6 +1245,54 @@ void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
             }
         }
     }
+}
+
+typedef struct {
+    float *out;
+    const float *Q;
+    const float *K;
+    const float *V;
+    int n_heads;
+    int head_dim;
+    float scale;
+    const int *window_starts;
+    int n_windows;
+} bidir_attn_task_t;
+
+static void bidir_attn_worker(int tid, int n_threads, void *arg) {
+    bidir_attn_task_t *t = (bidir_attn_task_t *)arg;
+    int chunk = (t->n_heads + n_threads - 1) / n_threads;
+    int h0 = tid * chunk;
+    int h1 = h0 + chunk;
+    if (h1 > t->n_heads) h1 = t->n_heads;
+    if (h0 >= h1) return;
+
+    qwen_bidirectional_attention_heads(t->out, t->Q, t->K, t->V,
+                                        t->n_heads, t->head_dim, t->scale,
+                                        t->window_starts, t->n_windows,
+                                        h0, h1);
+}
+
+void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
+                                   const float *V, int seq,
+                                   int n_heads, int head_dim, float scale,
+                                   const int *window_starts, int n_windows) {
+    (void)seq;
+
+    if (tp.n_threads > 1 && n_heads >= 2) {
+        bidir_attn_task_t task = {
+            .out = out, .Q = Q, .K = K, .V = V,
+            .n_heads = n_heads, .head_dim = head_dim, .scale = scale,
+            .window_starts = window_starts, .n_windows = n_windows
+        };
+        parallel_for(bidir_attn_worker, &task);
+        return;
+    }
+
+    qwen_bidirectional_attention_heads(out, Q, K, V,
+                                        n_heads, head_dim, scale,
+                                        window_starts, n_windows,
+                                        0, n_heads);
 }
 
 static void qwen_causal_attention_heads(float *out, const float *Q, const float *K,
