@@ -406,25 +406,34 @@ float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames
  * Live Audio: stdin reader thread for incremental streaming
  * ======================================================================== */
 
-#ifndef _MSC_VER
-#include <pthread.h>
-
 /* Append n_new float samples to la->samples under mutex + signal condvar. */
-static void live_audio_append(qwen_live_audio_t *la, const float *data, int n_new) {
+void live_audio_append(qwen_live_audio_t *la, const float *data, int n_new) {
     if (!la || !data || n_new <= 0) return;
 
+#ifdef _WIN32
+    EnterCriticalSection(&la->mutex);
+#else
     pthread_mutex_lock(&la->mutex);
+#endif
     int64_t need = la->n_samples + (int64_t)n_new;
     if (need > la->capacity) {
         int64_t new_cap = la->capacity > 0 ? la->capacity : 32000;
         while (new_cap < need) new_cap *= 2;
         if ((uint64_t)new_cap > (uint64_t)(SIZE_MAX / sizeof(float))) {
+#ifdef _WIN32
+            LeaveCriticalSection(&la->mutex);
+#else
             pthread_mutex_unlock(&la->mutex);
+#endif
             return;
         }
         float *tmp = (float *)realloc(la->samples, (size_t)new_cap * sizeof(float));
         if (!tmp) {
+#ifdef _WIN32
+            LeaveCriticalSection(&la->mutex);
+#else
             pthread_mutex_unlock(&la->mutex);
+#endif
             return;
         }
         la->samples = tmp;
@@ -432,13 +441,18 @@ static void live_audio_append(qwen_live_audio_t *la, const float *data, int n_ne
     }
     memcpy(la->samples + (size_t)la->n_samples, data, (size_t)n_new * sizeof(float));
     la->n_samples += n_new;
+#ifdef _WIN32
+    WakeConditionVariable(&la->cond);
+    LeaveCriticalSection(&la->mutex);
+#else
     pthread_cond_signal(&la->cond);
     pthread_mutex_unlock(&la->mutex);
+#endif
 }
 
 /* Convert a chunk of s16le bytes to float samples and append. */
-static void live_audio_convert_and_append(qwen_live_audio_t *la,
-                                          const uint8_t *buf, size_t n_bytes) {
+void live_audio_convert_and_append(qwen_live_audio_t *la,
+                                   const uint8_t *buf, size_t n_bytes) {
     int n_frames = (int)(n_bytes / 2);
     if (n_frames <= 0) return;
     float *tmp = (float *)malloc((size_t)n_frames * sizeof(float));
@@ -455,7 +469,11 @@ typedef struct {
     int data_remaining;  /* bytes remaining in WAV data chunk, -1 if raw */
 } live_reader_ctx_t;
 
+#ifdef _WIN32
+static DWORD WINAPI live_reader_thread(LPVOID arg) {
+#else
 static void *live_reader_thread(void *arg) {
+#endif
     live_reader_ctx_t *rctx = (live_reader_ctx_t *)arg;
     qwen_live_audio_t *la = rctx->la;
     int is_wav = rctx->is_wav;
@@ -466,11 +484,19 @@ static void *live_reader_thread(void *arg) {
     const size_t READ_SIZE = 64000;
     uint8_t *buf = (uint8_t *)malloc(READ_SIZE);
     if (!buf) {
+#ifdef _WIN32
+        EnterCriticalSection(&la->mutex);
+        la->eof = 1;
+        WakeConditionVariable(&la->cond);
+        LeaveCriticalSection(&la->mutex);
+        return 0;
+#else
         pthread_mutex_lock(&la->mutex);
         la->eof = 1;
         pthread_cond_signal(&la->cond);
         pthread_mutex_unlock(&la->mutex);
         return NULL;
+#endif
     }
 
     while (1) {
@@ -486,14 +512,25 @@ static void *live_reader_thread(void *arg) {
     }
 
     free(buf);
+#ifdef _WIN32
+    EnterCriticalSection(&la->mutex);
+    la->eof = 1;
+    WakeConditionVariable(&la->cond);
+    LeaveCriticalSection(&la->mutex);
+    return 0;
+#else
     pthread_mutex_lock(&la->mutex);
     la->eof = 1;
     pthread_cond_signal(&la->cond);
     pthread_mutex_unlock(&la->mutex);
     return NULL;
+#endif
 }
 
 qwen_live_audio_t *qwen_live_audio_start_stdin(void) {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
     /* Read enough to detect WAV vs raw: we need at least 12 bytes for RIFF+WAVE,
      * but a full WAV header is typically 44 bytes. Read up to 4096 to cover
      * any extended header chunks before the data chunk. */
@@ -573,8 +610,13 @@ qwen_live_audio_t *qwen_live_audio_start_stdin(void) {
     /* Allocate live audio context */
     qwen_live_audio_t *la = (qwen_live_audio_t *)calloc(1, sizeof(qwen_live_audio_t));
     if (!la) return NULL;
+#ifdef _WIN32
+    InitializeCriticalSection(&la->mutex);
+    InitializeConditionVariable(&la->cond);
+#else
     pthread_mutex_init(&la->mutex, NULL);
     pthread_cond_init(&la->cond, NULL);
+#endif
 
     /* Convert and append any PCM data already read in the header buffer */
     if (is_wav && pcm_in_header > 0) {
@@ -594,12 +636,22 @@ qwen_live_audio_t *qwen_live_audio_start_stdin(void) {
     rctx->is_wav = is_wav;
     rctx->data_remaining = is_wav ? (data_chunk_size - (int)pcm_in_header) : -1;
 
+#ifdef _WIN32
+    la->thread = CreateThread(NULL, 0, live_reader_thread, rctx, 0, NULL);
+    if (!la->thread) {
+        fprintf(stderr, "qwen_live_audio_start_stdin: failed to create reader thread\n");
+        free(rctx);
+        qwen_live_audio_free(la);
+        return NULL;
+    }
+#else
     if (pthread_create(&la->thread, NULL, live_reader_thread, rctx) != 0) {
         fprintf(stderr, "qwen_live_audio_start_stdin: failed to create reader thread\n");
         free(rctx);
         qwen_live_audio_free(la);
         return NULL;
     }
+#endif
 
     return la;
 }
@@ -607,12 +659,20 @@ qwen_live_audio_t *qwen_live_audio_start_stdin(void) {
 void qwen_live_audio_free(qwen_live_audio_t *la) {
     if (!la) return;
     /* If thread was started, wait for it to finish */
+#ifdef _WIN32
+    if (la->thread) {
+        WaitForSingleObject(la->thread, INFINITE);
+        CloseHandle(la->thread);
+    }
+    DeleteCriticalSection(&la->mutex);
+    /* CONDITION_VARIABLE has no destroy on Windows */
+#else
     if (la->thread) {
         pthread_join(la->thread, NULL);
     }
     pthread_mutex_destroy(&la->mutex);
     pthread_cond_destroy(&la->cond);
+#endif
     free(la->samples);
     free(la);
 }
-#endif /* !_MSC_VER */

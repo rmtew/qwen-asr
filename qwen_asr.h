@@ -10,7 +10,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
-#ifndef _MSC_VER
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <pthread.h>
 #endif
 
@@ -275,7 +278,6 @@ typedef struct {
  * Live Audio (incremental stdin streaming)
  * ======================================================================== */
 
-#ifndef _MSC_VER
 typedef struct {
     /* Written by reader thread under mutex */
     float *samples;
@@ -283,14 +285,16 @@ typedef struct {
     int64_t n_samples;          /* number of valid samples in buffer */
     int64_t capacity;           /* allocated capacity (in samples) */
     int eof;
+#ifdef _WIN32
+    CRITICAL_SECTION mutex;
+    CONDITION_VARIABLE cond;
+    HANDLE thread;
+#else
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     pthread_t thread;
-} qwen_live_audio_t;
-#else
-/* Opaque on MSVC — live streaming requires pthreads (Linux only) */
-typedef struct qwen_live_audio_s qwen_live_audio_t;
 #endif
+} qwen_live_audio_t;
 
 /* ========================================================================
  * API Functions

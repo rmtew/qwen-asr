@@ -28,6 +28,19 @@
 #define strdup _strdup
 #endif
 
+/* Platform-abstracted live audio mutex/condvar operations */
+#ifdef _WIN32
+#define LIVE_LOCK(l)    EnterCriticalSection(&(l)->mutex)
+#define LIVE_UNLOCK(l)  LeaveCriticalSection(&(l)->mutex)
+#define LIVE_WAIT(l)    SleepConditionVariableCS(&(l)->cond, &(l)->mutex, INFINITE)
+#define LIVE_SIGNAL(l)  WakeConditionVariable(&(l)->cond)
+#else
+#define LIVE_LOCK(l)    pthread_mutex_lock(&(l)->mutex)
+#define LIVE_UNLOCK(l)  pthread_mutex_unlock(&(l)->mutex)
+#define LIVE_WAIT(l)    pthread_cond_wait(&(l)->cond, &(l)->mutex)
+#define LIVE_SIGNAL(l)  pthread_cond_signal(&(l)->cond)
+#endif
+
 #ifdef USE_CUBLAS
 #include "qwen_asr_gpu.h"
 qwen_gpu_ctx_t *g_gpu_ctx = NULL;
@@ -1472,7 +1485,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
     if (live) {
         /* Seed local buffer with whatever is available now. */
-        pthread_mutex_lock(&live->mutex);
+        LIVE_LOCK(live);
         int64_t live_start = live->sample_offset;
         int64_t live_count = live->n_samples;
         live_eof = live->eof;
@@ -1481,12 +1494,12 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         if (local_n_samples > 0) {
             local_capacity = local_n_samples + chunk_samples * 4;
             if ((uint64_t)local_capacity > (uint64_t)(SIZE_MAX / sizeof(float))) {
-                pthread_mutex_unlock(&live->mutex);
+                LIVE_UNLOCK(live);
                 return NULL;
             }
             local_samples = (float *)malloc((size_t)local_capacity * sizeof(float));
             if (!local_samples) {
-                pthread_mutex_unlock(&live->mutex);
+                LIVE_UNLOCK(live);
                 return NULL;
             }
             memcpy(local_samples, live->samples, (size_t)local_n_samples * sizeof(float));
@@ -1494,7 +1507,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         /* Producer buffer is now mirrored locally: reset it to bound memory. */
         live->sample_offset = live_start + live_count;
         live->n_samples = 0;
-        pthread_mutex_unlock(&live->mutex);
+        LIVE_UNLOCK(live);
         audio_samples = local_samples;
         audio_n_samples = local_base_sample + local_n_samples;
     } else {
@@ -1659,9 +1672,9 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         /* Live mode: wait until we have enough data for the next chunk. */
         if (live) {
             int64_t want = audio_cursor + chunk_samples;
-            pthread_mutex_lock(&live->mutex);
+            LIVE_LOCK(live);
             while (live->sample_offset + live->n_samples < want && !live->eof)
-                pthread_cond_wait(&live->cond, &live->mutex);
+                LIVE_WAIT(live);
 
             int64_t live_start = live->sample_offset;
             int64_t live_count = live->n_samples;
@@ -1685,7 +1698,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 int64_t delta64 = live_end - local_end;
                 int64_t src_off64 = local_end - live_start;
                 if (delta64 < 0 || src_off64 < 0 || src_off64 > live_count) {
-                    pthread_mutex_unlock(&live->mutex);
+                    LIVE_UNLOCK(live);
                     break;
                 }
 
@@ -1693,13 +1706,13 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                     int64_t new_cap = local_capacity > 0 ? local_capacity : 32000;
                     while (new_cap < local_n_samples + delta64) new_cap *= 2;
                     if ((uint64_t)new_cap > (uint64_t)(SIZE_MAX / sizeof(float))) {
-                        pthread_mutex_unlock(&live->mutex);
+                        LIVE_UNLOCK(live);
                         break;
                     }
                     float *tmp = (float *)realloc(local_samples,
                                                   (size_t)new_cap * sizeof(float));
                     if (!tmp) {
-                        pthread_mutex_unlock(&live->mutex);
+                        LIVE_UNLOCK(live);
                         break;
                     }
                     local_samples = tmp;
@@ -1715,7 +1728,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             live->sample_offset = live_end;
             live->n_samples = 0;
             live_eof = is_eof_now;
-            pthread_mutex_unlock(&live->mutex);
+            LIVE_UNLOCK(live);
 
             audio_samples = local_samples;
             audio_n_samples = local_base_sample + local_n_samples;
@@ -1987,6 +2000,14 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         /* Decoder KV reuse:
          * keep the longest unchanged prefill prefix and only prefill delta tokens. */
         ctx->kv_cache_len = reused_prefill;
+#ifdef USE_CUBLAS
+        /* Reset GPU KV sync position so the next sync re-uploads from the
+         * reuse point.  Without this, the GPU retains stale KV entries from
+         * the previous chunk's decode for positions [reused_prefill, old_len)
+         * that will be overwritten by the current CPU prefill. */
+        if (ctx->gpu_dec_ctx)
+            qwen_gpu_kv_cache_reset((qwen_gpu_dec_ctx_t *)ctx->gpu_dec_ctx);
+#endif
         int delta_prefill = prefill_len - reused_prefill;
         if (delta_prefill > 0) {
             qwen_decoder_prefill(ctx,
