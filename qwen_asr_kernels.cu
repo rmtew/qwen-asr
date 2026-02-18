@@ -17,6 +17,8 @@
  *   qwen_argmax_f32          - Single-block argmax reduction
  *   qwen_f16_to_f32          - On-device FP16→F32 weight dequantization
  *   qwen_fp16_matvec_f32     - Fused FP16-weight matvec (no scratch buffer)
+ *   qwen_int8_matvec_f32     - Fused INT8-weight matvec (per-row scale)
+ *   qwen_int8_to_f32         - On-device INT8→F32 weight dequantization
  *
  * Kernel inventory (encoder):
  *   qwen_layer_norm_f32      - LayerNorm with bias (multi-row)
@@ -537,6 +539,126 @@ extern "C" __global__ void qwen_fp16_matvec_f32(float *out,
         val += __shfl_down_sync(0xFFFFFFFFu, val, 1);
         if (tid == 0) out[row] = val;
     }
+}
+
+/* ========================================================================
+ * qwen_int8_matvec_f32 - Fused INT8-weight matrix-vector product
+ *
+ * out[row] = scale[row] * sum_i( (float)W_int8[row,i] * A[i] )
+ *
+ * Reads INT8 weights via 128-bit uint4 loads (16 INT8 values per load),
+ * converts to F32 in registers, multiplies by activation cached in shared
+ * memory. Per-row scale factor applied after final reduction.
+ * Bandwidth: 1 byte/weight element (half of FP16, quarter of F32).
+ *
+ * Grid: N (one block per output element), Block: 256
+ * Shared memory: K * sizeof(float) for activation caching
+ * Requires: K divisible by 16 (true for all model dimensions)
+ * ======================================================================== */
+
+extern "C" __global__ void qwen_int8_matvec_f32(float *out,
+                                                  const signed char *W,
+                                                  const float *scale,
+                                                  const float *A,
+                                                  int N, int K) {
+    int row = (int)blockIdx.x;
+    if (row >= N) return;
+    int tid = (int)threadIdx.x;
+
+    extern __shared__ float sh[];
+
+    /* Vectorized activation load: 128-bit float4 */
+    {
+        int n4 = K >> 2;
+        const float4 *A4 = (const float4 *)A;
+        float4 *sh4 = (float4 *)sh;
+        for (int i = tid; i < n4; i += (int)blockDim.x)
+            sh4[i] = A4[i];
+    }
+    __syncthreads();
+
+    /* Vectorized dot product: 128-bit uint4 weight loads (16 INT8 per load) */
+    const uint4 *w_vec = (const uint4 *)(W + (size_t)row * K);
+    int n16 = K >> 4;
+    float sum = 0.0f;
+
+    for (int vi = tid; vi < n16; vi += (int)blockDim.x) {
+        uint4 w16 = w_vec[vi];
+        int base = vi * 16;
+
+        /* Extract 16 signed bytes from 4 uints */
+        signed char b[16];
+        b[ 0] = (signed char)( w16.x        & 0xFF);
+        b[ 1] = (signed char)((w16.x >>  8) & 0xFF);
+        b[ 2] = (signed char)((w16.x >> 16) & 0xFF);
+        b[ 3] = (signed char)((w16.x >> 24) & 0xFF);
+        b[ 4] = (signed char)( w16.y        & 0xFF);
+        b[ 5] = (signed char)((w16.y >>  8) & 0xFF);
+        b[ 6] = (signed char)((w16.y >> 16) & 0xFF);
+        b[ 7] = (signed char)((w16.y >> 24) & 0xFF);
+        b[ 8] = (signed char)( w16.z        & 0xFF);
+        b[ 9] = (signed char)((w16.z >>  8) & 0xFF);
+        b[10] = (signed char)((w16.z >> 16) & 0xFF);
+        b[11] = (signed char)((w16.z >> 24) & 0xFF);
+        b[12] = (signed char)( w16.w        & 0xFF);
+        b[13] = (signed char)((w16.w >>  8) & 0xFF);
+        b[14] = (signed char)((w16.w >> 16) & 0xFF);
+        b[15] = (signed char)((w16.w >> 24) & 0xFF);
+
+        sum += (float)b[ 0] * sh[base +  0];
+        sum += (float)b[ 1] * sh[base +  1];
+        sum += (float)b[ 2] * sh[base +  2];
+        sum += (float)b[ 3] * sh[base +  3];
+        sum += (float)b[ 4] * sh[base +  4];
+        sum += (float)b[ 5] * sh[base +  5];
+        sum += (float)b[ 6] * sh[base +  6];
+        sum += (float)b[ 7] * sh[base +  7];
+        sum += (float)b[ 8] * sh[base +  8];
+        sum += (float)b[ 9] * sh[base +  9];
+        sum += (float)b[10] * sh[base + 10];
+        sum += (float)b[11] * sh[base + 11];
+        sum += (float)b[12] * sh[base + 12];
+        sum += (float)b[13] * sh[base + 13];
+        sum += (float)b[14] * sh[base + 14];
+        sum += (float)b[15] * sh[base + 15];
+    }
+    __syncthreads();
+
+    /* Block reduction: shared memory down to warp, then warp shuffle */
+    sh[tid] = sum;
+    __syncthreads();
+    for (int stride = (int)blockDim.x / 2; stride > 32; stride >>= 1) {
+        if (tid < stride) sh[tid] += sh[tid + stride];
+        __syncthreads();
+    }
+    /* Final warp: shuffle reduction (no barriers needed) */
+    if (tid < 32) {
+        float val = sh[tid] + sh[tid + 32];
+        val += __shfl_down_sync(0xFFFFFFFFu, val, 16);
+        val += __shfl_down_sync(0xFFFFFFFFu, val, 8);
+        val += __shfl_down_sync(0xFFFFFFFFu, val, 4);
+        val += __shfl_down_sync(0xFFFFFFFFu, val, 2);
+        val += __shfl_down_sync(0xFFFFFFFFu, val, 1);
+        if (tid == 0) out[row] = val * scale[row];
+    }
+}
+
+/* ========================================================================
+ * qwen_int8_to_f32 - On-device INT8 to F32 dequantization
+ *
+ * Converts INT8 weight data to F32 using per-row scale factors.
+ * out[idx] = (float)in[idx] * scale[idx / cols]
+ * Grid: ceil(n/256), Block: 256
+ * ======================================================================== */
+
+extern "C" __global__ void qwen_int8_to_f32(float *out,
+                                              const signed char *in,
+                                              const float *scale,
+                                              int n, int cols) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n) return;
+    int row = idx / cols;
+    out[idx] = (float)in[idx] * scale[row];
 }
 
 /* ========================================================================

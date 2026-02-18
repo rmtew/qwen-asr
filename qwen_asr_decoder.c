@@ -545,6 +545,7 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
         qwen_swiglu_multiply(gate_buf, gate_buf, 1, intermediate);
         qwen_linear_nobias_bf16(ffn_out, gate_buf, l->down_weight_bf16, 1, intermediate, dim);
         qwen_add_inplace(x, ffn_out, dim);
+
     }
 
     ctx->kv_cache_len = pos + 1;

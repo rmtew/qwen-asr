@@ -297,9 +297,16 @@ static void gpu_upload_decoder_weights(qwen_gpu_ctx_t *gpu,
             n += (qwen_gpu_upload_weight_bf16(gpu, l->gate_up_fused_bf16, 2 * inter, h) == 0);
     }
 
-    /* Token embeddings (tied with lm_head, used by argmax_matvec) */
-    if (dec->tok_embeddings_bf16)
+    /* Token embeddings (tied with lm_head, used by argmax_matvec).
+     * Always upload as FP16 (not INT8) — lm_head logit accuracy is critical
+     * for correct argmax, and INT8 quantization error can flip tokens. */
+    if (dec->tok_embeddings_bf16) {
+        /* Temporarily switch to FP16 mode for this weight */
+        qwen_gpu_set_int8_mode(gpu, 0);
+        qwen_gpu_set_fp16_mode(gpu, 1);
         n += (qwen_gpu_upload_weight_bf16(gpu, dec->tok_embeddings_bf16, cfg->vocab_size, h) == 0);
+        qwen_gpu_set_fp16_mode(gpu, 0);
+    }
 
     if (qwen_verbose >= 1)
         fprintf(stderr, "GPU: uploaded %d decoder bf16->f32 weights\n", n);
@@ -352,13 +359,19 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     if (g_gpu_ctx) {
         if (qwen_verbose >= 1) fprintf(stderr, "Uploading weights to GPU...\n");
         gpu_upload_encoder_weights(g_gpu_ctx, &ctx->encoder, &ctx->config);
-        /* Decoder weights: FP16 when --fp16 is set (halves VRAM) */
-        if (qwen_get_gpu_fp16()) {
+        /* Decoder weights: INT8 takes priority over FP16 */
+        if (qwen_get_gpu_int8()) {
+            qwen_gpu_set_int8_mode(g_gpu_ctx, 1);
+            if (qwen_verbose >= 1)
+                fprintf(stderr, "GPU: INT8 mode — decoder weights as INT8 (per-row absmax)\n");
+        } else if (qwen_get_gpu_fp16()) {
             qwen_gpu_set_fp16_mode(g_gpu_ctx, 1);
             if (qwen_verbose >= 1)
                 fprintf(stderr, "GPU: FP16 mode — decoder weights as FP16\n");
         }
         gpu_upload_decoder_weights(g_gpu_ctx, &ctx->decoder, &ctx->config);
+        if (qwen_get_gpu_int8())
+            qwen_gpu_set_int8_mode(g_gpu_ctx, 0);
         if (qwen_get_gpu_fp16())
             qwen_gpu_set_fp16_mode(g_gpu_ctx, 0);
         if (qwen_verbose >= 1) qwen_gpu_print_stats(g_gpu_ctx);

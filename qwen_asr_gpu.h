@@ -69,6 +69,14 @@ void qwen_gpu_set_fp16_mode(qwen_gpu_ctx_t *gpu, int enable);
 /* Query whether a weight (by handle) is stored as FP16. Returns 1 if FP16, 0 if F32. */
 int qwen_gpu_weight_is_fp16(qwen_gpu_ctx_t *gpu, int handle);
 
+/* Set INT8 upload mode. When enabled, qwen_gpu_upload_weight_bf16() converts
+ * BF16->INT8 (1 byte/element + per-row scale) instead of BF16->F32/FP16.
+ * GEMM automatically dispatches to INT8 matvec kernel for INT8 weights. */
+void qwen_gpu_set_int8_mode(qwen_gpu_ctx_t *gpu, int enable);
+
+/* Query whether a weight (by handle) is stored as INT8. */
+int qwen_gpu_weight_is_int8(qwen_gpu_ctx_t *gpu, int handle);
+
 /* Print GPU memory usage stats to stderr. */
 void qwen_gpu_print_stats(qwen_gpu_ctx_t *gpu);
 
@@ -77,6 +85,7 @@ typedef struct {
     int n_weights;
     int n_weights_f32;
     int n_weights_f16;
+    int n_weights_int8;
     size_t vram_weights;
     size_t vram_buffers;
 } qwen_gpu_stats_t;
@@ -92,6 +101,12 @@ void *qwen_gpu_get_cublas_handle(qwen_gpu_ctx_t *gpu);
  * Encoder weights (F32 on disk) are unaffected. */
 void qwen_set_gpu_fp16(int enable);
 int  qwen_get_gpu_fp16(void);
+
+/* Global INT8 flag for ASR decoder weights. Call before qwen_load() so
+ * decoder BF16 weights are uploaded as INT8 (per-row absmax quantization).
+ * Takes priority over FP16 when both are set. */
+void qwen_set_gpu_int8(int enable);
+int  qwen_get_gpu_int8(void);
 
 #endif /* USE_CUBLAS */
 
